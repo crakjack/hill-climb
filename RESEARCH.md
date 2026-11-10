@@ -71,10 +71,9 @@ Thin evidence: no study validates a particular target score, panel size, or roun
 
 ## How the skill uses this
 
-`SKILL.md` puts this together.
-
-- A frozen contract per version (brief, scope, reference pack, gates, rubric, panel, stop rule), approved by you once.
-- Round 0 judges the reference itself. If the bar product scores 6, the rubric is broken.
-- Each round, every judge gets the reference and the artifact as A and B in random order, with no history, scores, or target. The keep metric is the gap to the reference, so judge drift cancels out.
-- The agent checks every blocker against the evidence itself. Required checks block success, and close calls get a head-to-head against the best version. The skill keeps the best version, reverts the rest, and ends with a status: `TARGET_MET`, `PLATEAU`, `BUDGET_LIMIT`, or `VERIFICATION_BLOCKED`.
-- A held-out auditor does the final pairwise check twice with order swapped, and you get a round-by-round table plus side-by-side screenshots.
+- One contract per run, approved once. It holds the brief, scope, evidence list, gates, rubric, panel, and stop rule.
+- Round 0 judges the reference too. If the product that sets the bar scores 6, the rubric is wrong.
+- Each round, every judge gets the reference and the current version as A and B in random order, with no history, scores, or target. A round is kept on its gap to the reference, so drifting judges cancel out.
+- The agent checks serious findings against the evidence itself. Required checks block success. The best version is kept and the rest are reverted.
+- A run ends as `TARGET_MET`, `PLATEAU`, `BUDGET_LIMIT`, or `VERIFICATION_BLOCKED`.
+- A model that stayed out of the loop does a final comparison in both orders.

@@ -1,127 +1,100 @@
 # Contract template
 
-Copy the two blocks below into `.hillclimb/<slug>/contract.md` and `contract.json`, fill them in, and get the user's yes before round 0. Judges see the brief and the rubric. They never see product names, the target, or the panel.
+Fill in both blocks, save them as `.hillclimb/<slug>/contract.md` and `contract.json`, and get the user's yes before round 0. Judges read the brief and the rubric, so keep product names, the target, and the panel out of those two sections.
 
 ```markdown
-# Contract: <slug> (v1)
+# Contract: <slug>
 
 ## Brief
-<One paragraph. What the artifact is, who uses it, what job it does. No product names.>
+<One paragraph. What it is, who uses it, what job it does.>
 
 ## Scope
-Will change: <files, components, routes>
+May change: <files, sections, components>
 Off-limits: <what the loop must not touch>
 
 ## Reference
-Source: <URL, app, or repo path>, captured <YYYY-MM-DD>
+<URL, app, or file, and the date you captured it. Or "none".>
 
-## States
-The artifact is captured in the same states, under the same file names, every round.
-- <state-id>: <route or screen>, <viewport>, <data condition>, <interaction performed first, if any>
+## Evidence
+The files judges look at. Same names on both sides, every round, no subfolders.
+- <file name>: <what it shows and how to capture it>
 
-Holdout (final audit only): <0 to 2 state ids>
-
-## Capture settings
-<tool, viewport, device scale factor, full page or not, fonts loaded, animations off, fixture data>
-
-## Hard gates
-Must pass before any judging:
-- `bun run typecheck`
-- `bun run lint`
-- <tests, build, contrast check, no horizontal overflow at 390px>
+## Gates
+Commands that must pass before any judging.
+- <command>
 
 ## Rubric
-<4 to 7 criteria. Each has an id, a one-sentence definition, 2 to 5 binary checks with ids, and anchors for 9, 7, and 5 written for this artifact. Mark required checks with (required).>
+### <criterion id>
+<One sentence saying what this criterion means.>
+Checks:
+- <check id>: <something a judge can answer yes or no from the evidence>
+- <check id> (required): <a check behind a "must work" outcome>
+9: <what a 9 looks like for this work>
+7: <what a 7 looks like>
+5: <what a 5 looks like>
 
 ## Panel
-J1 fable-5.1, J2 gpt-6-astra, J3 gpt-6.1-sol. Auditor <model>, final audit only.
+<Judge ids with model and family. The auditor.>
 
 ## Stop
-Parity: every gap >= -0.5 and mean gap >= 0, plus <target and floor, if any>. Required checks pass. No confirmed blockers.
-Plateau: two reverts in a row, triage, one more round on a triaged gap. Cap: 8 rounds.
-Noise floor: <filled in by round 0, then frozen>
+<Parity or target. Round cap. Time budget.>
 ```
 
 ```json
 {
   "reference": true,
-  "criteria": ["task-clarity", "hierarchy", "craft", "copy", "identity"],
-  "checks": ["tc1", "tc2", "tc3", "tc4", "hi1", "hi2", "hi3", "cr1", "cr2", "cr3", "co1", "co2", "co3", "id1", "id2"],
-  "required": ["tc2", "tc4"],
+  "criteria": ["clarity", "craft"],
+  "checks": ["cl1", "cl2", "cr1", "cr2"],
+  "required": ["cl2"],
   "judges": { "J1": "anthropic", "J2": "openai", "J3": "openai" },
-  "auditorFamily": "google",
-  "noiseFloor": null,
-  "target": null,
-  "floor": null
+  "target": null
 }
 ```
 
-Set `target` only if the user wants an absolute bar on top of parity. The mean of criterion medians must reach `target`, and every criterion must reach `floor` (default `target` minus 1). With `"reference": false`, `target` is the stop condition and `noiseFloor` defaults to 1. `required` lists the checks behind the user's must-work outcomes.
+Set `"reference": false` when there's no reference, and give a `target`. The ids in `contract.json` must match the rubric exactly, because the helper rejects replies that use other ids.
 
-## Writing good criteria
+## Writing criteria
 
-- Write the teardown first. "What does the reference do that ours doesn't?" gives better criteria than a generic design checklist.
-- Every check has to be observable in a captured state, on both sides. "Primary action visible without scrolling at 390x844" works. "Feels premium" doesn't, and neither does "uses our design tokens", which only one side can pass and which gives away which side is ours.
-- If a check needs an interaction (a confirm dialog, a save toast), add the post-interaction state to the pack.
-- Anchor 9, 7, and 5 in this artifact's terms. Generic anchors drift toward 8.
-- Separate criteria that trade off, such as density and clarity, so one score can't hide the other.
-- Watch the wording. Rubric language steers taste. Anthropic found that "museum quality" pushed designs toward one look. Describe the qualities you want, not a vibe.
-- Expect criteria to change once you see real outputs. That's normal. Version the contract and re-run round 0.
+- Start from the reference. "What does it do that ours doesn't?" gives better criteria than a generic checklist.
+- A judge has to be able to answer each check from the evidence, for both sides. "The primary action is visible without scrolling" works. "Feels premium" doesn't. Neither does "uses our design tokens", which only one side can pass and which gives away whose side is whose.
+- Write the 9, 7, and 5 in terms of this piece of work. Generic descriptions pull every score toward 8.
+- Split qualities that trade off, such as density and clarity, so one score can't hide the other.
+- Describe qualities, not a mood. Wording steers taste. A phrase like "museum quality" pushes every design toward one look.
 
-## Example: settings page vs a competitor's
+## Two worked criteria
 
-States: `main-desktop` (1440x900), `main-mobile` (390x844), `empty-desktop`, `delete-confirm-desktop` (after clicking delete), `saved-desktop` (after saving a change). Holdout: `error-mobile` (save fails on a 390x844 screen).
+For a settings page, judged from screenshots:
 
 ```markdown
 ### task-clarity
 A first-time user can find and finish the main settings tasks without guessing.
 Checks:
-- tc1: every setting has a visible label or a recognizable icon with a tooltip
-- tc2 (required): the delete-confirm state asks for confirmation and names what gets deleted
+- tc1: every setting has a visible label
+- tc2 (required): the delete screenshot shows a confirmation that names what gets deleted
 - tc3: the empty state says what to do next
-- tc4 (required): the saved state shows visible feedback on the same screen
-9: Every task in the brief takes one obvious path, with no dead ends in any captured state.
+9: Every task has one obvious path, with no dead ends in any screenshot.
 7: The main tasks work, but one needs a second look or an extra click.
-5: At least one task needs hunting, guessing, or a second try.
-
-### hierarchy
-Each screen has one clear focal point, and related settings read as groups.
-Checks:
-- hi1: groups have headings and consistent spacing between them
-- hi2: nothing truncates or overlaps at 390x844
-- hi3: section order matches how often people use each setting
-9: You can scan the page and land on the right group within a couple of seconds at both viewports.
-7: Groups are clear on desktop, but mobile loses some of the structure.
-5: The content is all there but reads as one long list, or the mobile layout is squeezed.
-
-### craft
-Spacing, type, color, and component states are consistent and deliberate.
-Checks:
-- cr1: disabled, loading, and saved states are styled, not browser defaults
-- cr2: spacing follows one scale, with no one-off gaps
-- cr3: type uses a small set of sizes and weights with clear roles
-9: Next to the best products in the category, differences come down to taste, not mistakes.
-7: Solid overall, with a few details that look unfinished next to the best in the category.
-5: Several visibly default or inconsistent details (mixed spacing, unstyled states).
-
-### copy
-Labels and messages say what happens.
-Checks:
-- co1: buttons name the action ("Revoke token", not "OK")
-- co2: error and confirm messages say what happens next and how to undo or fix it
-- co3: one term per concept across all states
-9: Every string earns its place, and nothing needs a second read.
-7: Clear, but a few strings are generic or longer than they need to be.
-5: Several vague or inconsistent strings, or a message that leaves the user stuck.
-
-### identity
-It reads as one deliberate product, not a template.
-Checks:
-- id1: colors, radii, and spacing stay consistent across all captured states
-- id2: no stock or template patterns that clash with the rest of the screen
-9: It looks designed on purpose, with a consistent visual language across every state.
-7: Consistent, but mostly stock patterns with little of its own.
-5: Generic or inconsistent. It could belong to any SaaS app.
+5: At least one task needs hunting or guessing.
 ```
 
-For other artifacts, keep the shape and change the criteria. For docs, try accuracy, task coverage, findability, and examples that run. For an API, try naming, consistency, error design, and the cost of the common path. For a landing page, try clarity of offer, proof, hierarchy, craft, and conversion path.
+For a quickstart page, judged from the text and the output of its examples:
+
+```markdown
+### first-success
+A new user gets a working result from this page alone.
+Checks:
+- fs1 (required): every command on the page runs as written
+- fs2: the page says what you should see after each step
+- fs3: prerequisites come before the first command
+9: Copy, paste, and it works, and you know it worked.
+7: It works, but one step leaves you unsure whether it did.
+5: You need another page or a guess to finish.
+```
+
+## Criteria to start from
+
+- UI: task clarity, hierarchy, craft, copy, consistency.
+- Landing page: clarity of the offer, proof, hierarchy, craft, path to the next step.
+- Docs: accuracy, task coverage, findability, examples that run.
+- API or library: naming, consistency, error design, cost of the common case.
+- CLI: discoverability, output you can read, error messages, sensible defaults.

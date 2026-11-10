@@ -1,23 +1,27 @@
 # hill-climb
 
-A skill for Claude Code and Codex that improves something you're building, round by round, until judges from different AI model families rate it even with a product you name as the bar.
+A skill for Claude Code and Codex. It improves something you're building, round by round, until judges from different AI model families rate it level with a reference you pick.
 
-You give it a task, a reference (a competitor's page, screenshots, a doc), the qualities you want to match, and what must work. It writes a rubric, builds or takes your current version, and loops:
+You give it a task, a reference such as a competitor's page, the qualities you want to match, and what must keep working. It writes a rubric, asks you to approve it, and then loops on its own:
 
-1. Fix the biggest verified issues.
-2. Run your checks (typecheck, lint, tests) and take fresh screenshots.
-3. Three judges compare your version with the reference, without knowing which is which. They get no history and no earlier scores.
-4. Keep the change only if the gap to the reference closed. Otherwise roll back to the best version so far.
+1. Fix the biggest problems the judges found.
+2. Run your checks, such as typecheck, lint, and tests.
+3. Three judges compare your version with the reference without knowing which is which. They see no history and no earlier scores.
+4. Keep the change if the gap to the reference closed. Otherwise roll back to the best version so far.
 
-It stops when you reach the reference, when progress stalls, or at a round or time limit. You get the best verified version, a score table by round, side-by-side screenshots, and the gaps that remain.
+It stops when you reach the reference, when three rounds in a row fail to improve, or at a round or time limit. You get the best version, a score table by round, and the gaps that remain.
 
-The loop is built around how judge-driven loops usually fail: scores that inflate over rounds, judges swayed by claims or the order artifacts are shown in, panels agreeing on bugs that don't exist, and revisions that break what worked. [`references/evidence.md`](references/evidence.md) links each rule to the paper or post behind it. [`RESEARCH.md`](RESEARCH.md) surveys existing tools and papers.
+It works for UI, copy, docs, code, API design, and CLIs. Only the evidence the judges look at changes.
+
+## Why it's built this way
+
+The simple loop, "score it 1 to 10 and iterate until the average is 9", fails in known ways. Scores inflate as judges see history. Judges get swayed by claims and by the order they see things in. Panels agree on bugs that don't exist. New revisions break what worked. Each rule in the skill blocks one of these, and [`references/why.md`](references/why.md) links each rule to its source. [`RESEARCH.md`](RESEARCH.md) surveys the existing tools and papers.
 
 ## Requirements
 
-- Claude Code, Codex CLI, or both, each logged in. Judges from two model families need access to both providers.
-- [bun](https://bun.sh), which runs `scripts/hc.ts` (blind A/B packing and the scoring math).
-- A browser tool for UI work, such as the Playwright MCP in Claude Code or Codex's computer use.
+- Claude Code and the Codex CLI, both logged in. Judges have to come from two model families.
+- [bun](https://bun.sh), to run the helper script.
+- For UI work, a browser tool such as the Playwright MCP.
 
 ## Install
 
@@ -26,13 +30,11 @@ git clone https://github.com/crakjack/hill-climb ~/.claude/skills/hill-climb
 ~/.claude/skills/hill-climb/install.sh
 ```
 
-`install.sh` copies the skill into `~/.codex/skills/hill-climb` for Codex and warns about anything missing. To update, run `git pull` in `~/.claude/skills/hill-climb` and run `install.sh` again. Restart open sessions afterwards.
-
-If you only use Codex, clone anywhere and run `install.sh`. It installs into both tools.
+`install.sh` copies the skill into `~/.codex/skills/hill-climb` and warns about anything missing. To update, run `git pull` in `~/.claude/skills/hill-climb` and run `install.sh` again. Restart open sessions afterwards.
 
 ## Use
 
-In Claude Code, type `/hill-climb`. In Codex, ask for the hill-climb skill by name. Both also trigger on phrases like "hill climb this" or "iterate until 9/10".
+In Claude Code, type `/hill-climb`. In Codex, ask for the hill-climb skill by name.
 
 ```
 /hill-climb build the billing settings page
@@ -40,28 +42,28 @@ ref: https://competitor.com/settings/billing
 match: how they show plan limits, the upgrade flow
 must work: changing plan asks for confirmation, invoices download
 constraints: our design tokens, no new dependencies
-target: 9   rounds: 8   budget: 60m      (all optional)
+target: 9   rounds: 8   budget: 60m      (optional)
 ```
 
-You can also paste your own rubric. The agent checks back with you once, to approve the rubric and plan, and then runs on its own. State lives in `.hillclimb/<slug>/` in your project, so an interrupted run can resume. Work happens on a `hillclimb/<slug>` branch.
+You can paste your own rubric too. Without a `ref`, each round is judged against the best version so far.
 
-## Choosing judges
+The run keeps its state in `.hillclimb/<slug>/` in your project and works on a `hillclimb/<slug>` branch, so you can stop and resume it, then merge or delete the branch.
 
-The default panel is fable-5.1 (Anthropic), gpt-6-astra (OpenAI), and gpt-6.1-sol (OpenAI), with a held-out auditor for the final check. Swap in whatever models you have. Keep at least three judges from at least two families, and at least one family different from the model doing the building. Edit:
+## Changing the judges
 
-- [`references/panel-claude-code.md`](references/panel-claude-code.md) and [`references/panel-codex.md`](references/panel-codex.md) for how each judge is called.
-- The `judges` map in each run's `contract.json` (judge id to model family), which the scoring script uses to check that a decision rests on two families.
+The default panel is fable-5.1, gpt-6-astra, and gpt-6.1-sol, with opus-5.5 as the final auditor. To use other models, edit [`references/panel-claude-code.md`](references/panel-claude-code.md) or [`references/panel-codex.md`](references/panel-codex.md). Keep three judges from two families, with one family different from the model doing the building.
 
 ## Files
 
 ```
-SKILL.md                         the loop the agent follows
-references/judge-prompt.md       the prompt each judge gets
-references/contract-template.md  rubric template with a worked example
+SKILL.md                         the loop
+references/contract-template.md  the contract and how to write a rubric
+references/judge-prompt.md       what each judge is sent
 references/panel-*.md            how to call judges from each tool
-references/evidence.md           the source behind each rule
-scripts/hc.ts                    packing, validation, keep/revert math, report table
-install.sh                       installs for Claude Code and Codex
+references/ui.md                 capturing screenshots for UI work
+references/extras.md             close calls, noisy scores, and other unusual cases
+references/why.md                the source behind each rule
+scripts/hc.ts                    blinding, scoring, and the keep-or-revert rule
 ```
 
 ## Uninstall
@@ -70,6 +72,4 @@ install.sh                       installs for Claude Code and Codex
 rm -rf ~/.claude/skills/hill-climb ~/.codex/skills/hill-climb
 ```
 
-## License
-
-MIT
+MIT license.

@@ -1,118 +1,132 @@
 ---
 name: hill-climb
-description: Iteratively improve an artifact (UI, page, copy, docs, API design, code) until a cross-model judge panel rates it at parity with a reference product, or above a target score. Freezes a rubric and reference pack, judges the artifact and the reference blind side by side every round, keeps only measured improvements, and stops on parity, plateau, or round cap. Use when the user says hill climb, hill-climb, "iterate until 9/10", "get this to the level of <competitor>", "judge and improve until", or invokes /hill-climb. Not for tuning an LLM prompt against a dataset (use `/claude-api hillclimb` for that).
+description: Improve any artifact in rounds (UI, copy, docs, code, API design) until judges from different model families rate it level with a reference, or above a target score. Each round is judged blind, only measured improvements are kept, and the loop stops on target, plateau, or budget. Use when the user says hill climb, "iterate until 9/10", "get this to the level of <competitor>", "judge and improve until", or invokes /hill-climb. To tune an LLM prompt against a test dataset, use `/claude-api hillclimb` instead.
 ---
 
 # Hill climb
 
-Improve one artifact in rounds. Each round, independent judges from different model families compare it blind with a reference that sets the bar. You fix verified issues, keep the change only if the gap to the reference closed, and stop at parity, a plateau, or the round cap.
-
-Judge-in-the-loop optimization fails in predictable ways. Scores inflate as context piles up, judges reward claims and effort, panels agree on false issues, and revisions break things that worked. Most rules below block one of those. `references/evidence.md` maps each rule to its source, so read it before relaxing one.
+Improve one thing in rounds. Each round, judges from other model families compare your version with a reference, without knowing which is which. You fix what they found, keep the change only if you got closer to the reference, and stop when you're level with it, when progress stalls, or when the budget runs out.
 
 ## Launch
 
-A typical request looks like this. Ask only for what's missing and would change the result.
-
 ```
-/hill-climb <artifact or feature>
-ref: <URL, screenshots, Mobbin flow, or competitor app>
-match: <the qualities that matter, e.g. "density of the table, how empty states teach">
-must work: <critical user outcomes>
-constraints: <scope, stack, what to preserve>
-target: 9   rounds: 8   budget: 60m      (all optional)
+/hill-climb <what to improve or build>
+ref: <URL, screenshots, file, or competitor>      optional
+match: <the qualities that matter>
+must work: <outcomes that can't break>
+constraints: <scope, stack, what to keep>
+target: 9   rounds: 8   budget: 60m               optional
 ```
 
-With a reference, the goal is parity. `target` adds an absolute bar: the mean of criterion medians must reach it and every criterion must reach `floor` (default target minus 1). Without a reference, see "No reference" at the end.
+Ask only for what's missing and would change the result. With a `ref`, the goal is to draw level with it. Without one, each round is judged against the best version so far, and the goal is `target`, which is 9 unless the user says otherwise. `rounds` and `budget` default to the values shown. If the user gives a rubric, use it as written.
+
+## Rules
+
+Judge loops fail in known ways, and each rule blocks one. `references/why.md` has the sources.
+
+1. Every judge is a separate model call with a fresh context. Never score the work yourself or play a judge.
+2. Judges get the brief, the rubric, and their two folders. They never get history, earlier scores, the target, your notes, or model names.
+3. Never put text aimed at judges into the work.
+4. The rubric is frozen once round 0 is logged. Never change it to make a round pass.
+5. Never re-judge unchanged work to get a better number.
+6. Check serious findings against the evidence yourself before acting on them. Panels agree on problems that aren't there.
+7. The best version wins, not the latest one.
+
+## Words
+
+- **Evidence** is the set of files judges look at, such as screenshots or the text itself.
+- **Control** is what a round is compared with. It's the reference, or the best version so far when there's no reference.
+- **Gap** is your score minus the control's on one criterion. Negative means you're behind.
+- **Parity** means the average gap is 0 or better and no criterion is more than half a point behind.
 
 ## Files and helper
 
-State lives in `.hillclimb/<slug>/` at the project root. Add `.hillclimb/` to `.git/info/exclude` so git resets never touch it. Pick a neutral slug like `settings-page`, not the competitor's name.
+State lives in `.hillclimb/<slug>/` in the project. Add `.hillclimb/` to `.git/info/exclude`.
 
 ```
-contract.md     brief, scope, states, capture settings, gates, rubric, panel, stop rule
-contract.json   criterion and check ids, judge families, noise floor, target (read by the helper)
-state.json      phase, round, incumbent round and SHA, reverts in a row
-history.tsv     round, sha, hypothesis, mean_gap, decision (keep | revert)
-reference/      frozen reference evidence, one file per state
-rounds/NN/      evidence/, mapping.json, judges/<id>.md, aggregate.json, decision.md
-report.md       final report
+contract.md     what you agreed with the user
+contract.json   criterion ids, check ids, judge families, target
+history.tsv     one row per round, written by the helper
+reference/      the reference's evidence, frozen after setup
+rounds/NN/      evidence/, judges/, notes.md
+report.md
 ```
 
-`scripts/hc.ts` handles blinding and the math so you never shuffle labels or compute medians by hand. Run `bun <this-skill>/scripts/hc.ts <command> .hillclimb/<slug> ...`.
+The helper does the blinding and the math. Run it as `bun <this skill>/scripts/hc.ts <command> .hillclimb/<slug> ...`.
 
-- `pack <dir> <round> <control-dir> [--audit]` copies the round's evidence and the control's (the reference) into a neutral temp folder per judge, as A and B in alternating random order. It writes `mapping.json` and prints each judge's A and B paths.
-- `aggregate <dir> <round> [--incumbent <round>] [--targets id,id]` validates each judge's JSON and un-blinds it. Then it computes per-judge paired gaps (artifact minus reference) and their medians, and writes `aggregate.json`. It lists failed checks and high or blocker issues to verify, and applies the keep rule against the incumbent.
-- `noise <dir> <roundA> <roundB>` turns two panel runs on the same evidence into a noise floor.
-- `table <dir>` prints the per-round markdown table for the report.
+| Command | What it does |
+|---|---|
+| `pack NN` | Copies round NN's evidence and the control's into one folder per judge, as A and B in random order, and prints the paths. |
+| `score NN [--targets a,b]` | Reads the judges' replies and prints the gaps, the findings you must verify, anything that looks off, and KEEP or REVERT. |
+| `log NN keep\|revert "<what you tried>"` | Records the round. |
+| `status` | Prints the best round, reverts in a row, what's unfinished, and the score table. Run it first when resuming. |
 
-## Resume
+## 1. Contract
 
-If `.hillclimb/<slug>/state.json` exists, resume. Read `contract.md`, `state.json`, `history.tsv`, and the latest `decision.md`. If HEAD isn't the SHA `state.json` expects, ask the user before touching git. If the latest round has a commit but incomplete judge outputs, restart it from Judge. Update `state.json` after every phase.
+If there's a reference, capture its evidence into `reference/` first, so the rubric comes from what you can see. Then write `contract.md` and `contract.json` from `references/contract-template.md` and get one yes from the user. It's the only planned check-in.
 
-## Phase 1: contract
+- **Brief and scope.** What it is, who uses it, what may change, what's off-limits.
+- **Evidence.** The files judges will look at. Use the same file names on both sides every round, with no subfolders. See "Adapting to the task".
+- **Gates.** Commands that must pass before any judging, such as typecheck, lint, and tests. Anything a script can check goes here, not in the rubric.
+- **Rubric.** Three to six criteria. Each has yes/no checks and a description of a 9, a 7, and a 5. Start from what the user asked to match and from what makes the reference good. Mark the checks behind "must work" as required. Leave product names out, because judges read it.
+- **Panel.** At least three judges from two model families, one of them outside your own. `references/panel-claude-code.md` and `references/panel-codex.md` list the defaults and how to call them.
+- **Stop.** Parity or target, round cap, time budget.
 
-1. Identify the artifact, or what to build if it doesn't exist yet, and the scope, meaning what may change and what's off-limits.
-2. Prepare git. Require a clean working tree, and if the user has uncommitted work, ask whether to commit it first. Create the branch `hillclimb/<slug>` from HEAD. Without git, copy the in-scope files to `.hillclimb/<slug>/snapshots/r00/`.
-3. List the states. A state is a screen or document section, a viewport, and a data condition. For example, the main screen at 1440x900 and 390x844 with real data, the empty state, and the error state. Every rubric check must be visible in at least one state. Add post-interaction states where a check needs one, such as a confirm dialog open or a save toast showing. Fix the capture settings once for both sides and every round: viewport, device scale factor, full page or not, fonts loaded, animations off, same fixture data. Optionally hold out 1 or 2 states. Judges never see them during the loop, and the final audit uses them to catch fixes that only work on the judged screens.
-4. Capture the reference into `reference/<state-id>.png` with the Playwright MCP, and holdout states into `reference/holdout/`. Use the codex-computer-use skill when a login or a real interaction is needed. For text or code, save one file per section with matching names. Crop or blur competitor logos where that's easy, since blinding hides position but not brand. The reference pack is frozen after this step.
-5. If the user gave a rubric, use it. Keep their criteria and wording, turn each criterion into checks and anchors, and add only what's missing. Otherwise tear down the reference, starting from the qualities the user asked to match. Write down what makes it good, then turn that into 4 to 7 criteria using `references/contract-template.md`. Each criterion gets binary checks and anchors for 9, 7, and 5. Mark the checks behind the user's "must work" outcomes as required. Anything a script can check goes in hard gates instead. Keep product names out of the brief and the rubric. Don't assume the reference is perfect.
-6. Fill in the panel and the stop rule, and write `contract.json`.
-7. Show the user `contract.md` and get a yes. This is the only planned check-in.
+Work on a branch named `hillclimb/<slug>`, starting from a clean git tree. Ask the user if the tree isn't clean. Without git, see `references/extras.md`.
 
-Round 0 fills in the noise floor, and then the contract is frozen. If the rubric has to change later, bump the version, re-run round 0 under it, and reset the revert counter. Never edit the rubric to make a failing round pass.
+## 2. Round 0
 
-## Panel
+1. If the work doesn't exist yet, build a first version, get it through the gates, and commit it.
+2. Capture its evidence into `rounds/00/evidence/`.
+3. Run `pack 00`. Send each judge `references/judge-prompt.md` filled in with its own paths, and save each reply to `rounds/00/judges/<id>.md`. Run `score 00`.
+4. Check the rubric before spending rounds on it. Look for these in what `score` prints.
+   - A judge couldn't open some evidence. Fix how you send it and rerun that judge.
+   - Judges split by more than 3 points on a criterion. The criterion is vague, so tighten its checks.
+   - The reference scores below 7 on a criterion. Either the criterion measures the wrong thing or the reference is weak there.
+   - A judge doubts the rubric, for example a check that bad work could pass.
+5. If the rubric needs fixing, fix it, delete `rounds/00/judges/`, and repeat step 3.
+6. Run `log 00 keep "baseline"`. If `score 00` already printed `parity: yes`, skip to the audit.
 
-At least three judges from at least two model families, with at least one family other than the builder's. The defaults are J1 fable-5.1 (anthropic), J2 gpt-6-astra (openai), and J3 gpt-6.1-sol (openai). How to call them depends on where you're running. In Claude Code, read `references/panel-claude-code.md`. In Codex, read `references/panel-codex.md`.
+With no reference, round 0 has nothing to compare with. Do steps 1 and 2, then log. Aim round 1 at the criterion you think is weakest, and do the step 4 checks on round 1's replies.
 
-The auditor is the strongest available model not on the panel, preferably from a family other than the builder's. The panel file names the default. Set `auditorFamily` in `contract.json`.
+## 3. Rounds
 
-Judges get their packet paths and the file list `pack` printed, nothing else. Never give them URLs, the repo, or this conversation. Every judge is a real, separate model call. Never role-play a judge or score the work yourself. If a judge is unavailable, tell the user and continue while two families remain. With fewer than two, stop with status `VERIFICATION_BLOCKED`. In each `decision.md`, record the model each judge actually ran on, as reported by the tool result or the codex log, not the one you asked for.
+1. **Plan.** Start from the confirmed findings on the best version, in its `notes.md`. Failed required checks come first, then the weakest criteria. Pick one to three findings that share a cause. Drop any that are wrong or outside the brief, and say why in this round's `notes.md`.
+2. **Build.** Make the change. Leave `.hillclimb/`, the gates, and off-limits areas alone.
+3. **Gate.** Run the gates and fix until they pass, then commit the round as one commit. After three failed tries, set the change aside with `git stash -u`, run `log NN revert "<what you tried>"`, and start the next round.
+4. **Judge.** Capture evidence into `rounds/NN/evidence/` and run `pack NN`. Call all judges in parallel, save their replies, and run `score NN --targets <the criteria you aimed at>`. If a reply is missing or invalid, rerun that judge once.
+5. **Verify.** Open the evidence for every finding `score` lists and confirm or reject it yourself. Write the verdicts in `notes.md`, along with the model each judge actually ran on.
+6. **Decide.** Keep the round if `score` says KEEP and you confirmed no blocker and no new required-check failure. Run `log NN keep|revert "<what you tried>"`. After reverting a committed round, run `git revert --no-edit HEAD` so the working tree is the best version again.
 
-## Phase 2: round 0
+KEEP means each criterion you aimed at gained at least half a point against the control, no criterion lost more than that, the average gap didn't fall, and two judges from two families scored every criterion.
 
-1. If the artifact doesn't exist yet, build the first version now, with the brief and rubric in hand, and get it through the hard gates. That version is the baseline. Otherwise run the hard gates and record any that already fail.
-2. Capture the artifact into `rounds/00/evidence/` with the same file names as `reference/`. Then run `pack <dir> 00 <dir>/reference`, send the panel the prompt from `references/judge-prompt.md`, save outputs to `rounds/00/judges/<id>.md`, and run `aggregate <dir> 00`.
-3. Confirm every judge actually saw the images. Look at `evidence_gaps` and whether its issues cite visual details. Drop any judge that can't see them.
-4. Measure noise. Copy `rounds/00/evidence/` to `rounds/00b/evidence/`, then pack, judge, and aggregate `00b` the same way. Run `noise <dir> 00 00b`. If the floor comes out above 1, the rubric is too noisy to climb. Tighten the checks on the criteria that swung most and redo round 0.
-5. Read the reference's scores. If the reference scores below 7 on a criterion, check that the criterion measures what the user cares about. A real weakness in the reference is fine, just note it. Where judges split by more than 3 points, read their reasons and tighten the checks if the criterion is ambiguous. Keep genuine differences of taste. Read the `rubric flags` too. A check that judges say could pass on bad work needs rewording now.
-6. Write `noiseFloor` into `contract.json` and freeze the contract. Then record round 0 as the incumbent in `state.json` and `history.tsv`.
+## 4. Stop
 
-## Phase 3: the loop
+End with one of these statuses.
 
-Each round runs plan, build, gate, judge, decide.
+- `TARGET_MET`. `score` prints `parity: yes`, and the target as met if one is set. Gates pass and no confirmed blocker remains.
+- `PLATEAU`. Three reverts in a row. After the second, look at what's left before trying again. If the remaining gaps come from the rubric, the scope, or noise, and not from the work, stop early.
+- `BUDGET_LIMIT`. The round cap or the time budget ran out. Stop while there's still time for the audit.
+- `VERIFICATION_BLOCKED`. Fewer than two judge families can run, or you can't capture evidence.
 
-**Plan.** Start from the incumbent's verified issues, not raw judge text. Failed required checks come first, then criteria below the floor. Otherwise pick 1 to 3 issues that share a cause and cost the most, and weight issues that several judges raised higher. That set is the round's hypothesis, and the criteria it should move are its targets. Reject issues that are wrong, out of scope, or conflict with the user's instructions, with a one-line reason and the evidence in `decision.md`. Requests for features outside the brief get rejected. Holding scope is your job.
+## 5. Audit and report
 
-**Build.** Make the change. Never add text aimed at judges, such as comments, captions, or alt text that praise the work or describe the fix. Never touch `.hillclimb/`, the gate scripts, or anything off-limits.
+1. Run `pack audit`. It makes two packets of the best version, in opposite orders, against the reference. With no reference, it uses the round 0 baseline. Send each packet to the auditor, a model that wasn't on the panel, in separate fresh calls. Save the replies as `rounds/audit/judges/AUD1.md` and `AUD2.md`, then run `score audit`. A verdict that flips with the order is unresolved, not a win.
+2. Write `report.md`. Lead with the status. Add the table from `status`, the audit verdicts, required-check results, the models that ran, the feedback you rejected and why, the gaps that remain, and the final evidence beside the reference's.
+3. Say plainly whether it got there. "Average gap -0.6, empty states still lose" is a useful result. The panel's verdict is evidence, and the user decides.
 
-**Gate.** Run the hard gates, with up to three fix attempts. If they still fail, revert the round without judging it. Otherwise make one commit for the round that includes the gate fixes.
+## Adapting to the task
 
-**Judge.** Capture fresh evidence into `rounds/NN/evidence/` and run `pack <dir> NN <dir>/reference`. Send each judge the prompt with its own A and B paths. Judges never get the change log, builder notes, earlier scores, the round number, the target, or which model built anything. Run all judges in parallel, save each raw output to `rounds/NN/judges/<id>.md`, and wait for all of them. If `aggregate` reports a judge's output as missing or invalid, rerun that judge once. Never re-judge an unchanged artifact to get a better score.
+Only the evidence and the gates change with the kind of work.
 
-**Decide.**
-1. Run `aggregate <dir> NN --incumbent <incumbent-round> --targets <ids>`. A criterion counts only when at least two judges from two families scored both sides.
-2. Check every listed blocker, high-severity issue, and required-check FAIL against the evidence yourself. Open the screenshot or read the code, because panels agree on false issues. Don't vote away a failure you can reproduce. Record each one in `decision.md` as confirmed or rejected, with the evidence.
-3. The helper prints KEEP when four things hold. Every target's gap improved by at least the noise floor. No criterion's gap fell by more than the floor. The mean gap didn't fall. Every criterion has quorum. A confirmed blocker overrides KEEP, and so does a confirmed required-check failure the incumbent didn't have.
-4. If the helper prints `close call`, settle it head to head before deciding. Copy this round's evidence to `rounds/NN-confirm/evidence/`, run `pack <dir> NN-confirm <dir>/rounds/<incumbent>/evidence`, judge it with the same prompt, and run `aggregate <dir> NN-confirm --targets <ids>`. The confirm round's verdict decides, and you don't re-run it.
-5. To keep, set the incumbent in `state.json` to this round and SHA, and reset the revert counter. To revert, tag the commit `hc/<slug>/rNN` so it stays reachable. Then run `git reset --hard <incumbent-sha>` (on the hillclimb branch only) and add one to the counter.
-6. If the helper flags a suspect jump of more than 2, confirm the change explains it before keeping. If it flags reference drift, note it in `decision.md`. Paired gaps cancel drift that hits both sides equally, so be wary of close calls.
-7. Append a row to `history.tsv` and write `decision.md`.
+| Improving | Evidence judges see | Typical gates | A reference could be |
+|---|---|---|---|
+| UI | Screenshots of each state. Read `references/ui.md` | typecheck, lint, tests | a competitor's screens |
+| Copy or a landing page | The text, one file per page or section | length limits, banned words | a page the user admires |
+| Docs | The pages, plus output from running their examples | links resolve, examples run | the best docs in the field |
+| Code or API design | The source or spec, plus a usage example | tests, typecheck | a library with the API you want |
+| CLI | Terminal output captured per command | tests | another tool's output |
 
-**Stop** when one of these holds. The status goes at the top of the report.
-- `TARGET_MET`. The helper prints `parity: yes`, plus `target ... met` if a target was set. Gates pass and you've confirmed no blockers or required-check failures.
-- `PLATEAU`. After two reverts in a row, triage before building again. Triage doesn't count as a round. Put each remaining gap in one of four buckets: an artifact gap, a rubric problem where judges contradict what you can see, a scope limit, or noise. If no artifact gap remains, stop. Otherwise the next round targets one triaged gap, and if that reverts too, stop.
-- `BUDGET_LIMIT`. The round cap (default 8), the time budget, or the user's spending limit. Stop early enough to leave time for the final audit.
-- `VERIFICATION_BLOCKED`. Fewer than two judge families can run, or evidence can't be captured.
+For anything else, ask what a person would look at to compare two versions. That's the evidence.
 
-## Phase 4: final audit and report
-
-1. Check out the incumbent and capture it into `rounds/audit/evidence/`, including any holdout states. Copy the files from `reference/` and `reference/holdout/` together into `rounds/audit/control/`.
-2. Run `pack <dir> audit <dir>/rounds/audit/control --audit`. It writes two packets, AUD1 and AUD2, with opposite orders. Send the auditor each one in a separate fresh context, and save the outputs as `rounds/audit/judges/AUD1.md` and `AUD2.md`. After both are back, make a third call with the blockers you rejected and your evidence, and ask whether each rejection holds. Keep it separate so it can't unblind the audit.
-3. Run `aggregate <dir> audit`. A criterion whose verdict flips with the order is unresolved. Don't report it as parity.
-4. Run `table <dir>` and write `report.md`. Start with the status, then include the table, the audit verdicts (holdout states called out), required-check results, the models that actually ran, rejected feedback with reasons, open issues, and side-by-side screenshots of reference and final for the main states. Always hand back the incumbent, never an unjudged later edit.
-5. Say plainly whether parity was reached. "Mean gap -0.6, spacing and empty states still lose" is a useful result. Every judge shares model taste, so the verdict is evidence, not acceptance. The user makes the final call.
-
-## No reference
-
-Set `"reference": false` in `contract.json`. The incumbent becomes the control, so each round compares the candidate against the best version so far. Round 0 records the baseline's evidence without judging it. From round 1, run `pack <dir> NN <dir>/rounds/<incumbent>/evidence`, and run `aggregate` without `--incumbent`, since every gap is already measured against the incumbent. Use a noise floor of 1 unless you measure one. Close calls need no confirm round, because every round is already head to head. Stop on the target, plateau, or the cap. Expect weaker results, because nothing anchors what a 9 means.
+`references/extras.md` covers the unusual cases: close calls, noisy scores, held-out evidence, changing the rubric mid-run, working without git, and resuming.
