@@ -1,87 +1,131 @@
 #!/usr/bin/env bun
-// Hill-climb helper. It does the blinding and the math so the agent doesn't.
+// Hill-climb helper. Run it from the project root.
 //
-//   bun hc.ts pack   <dir> <round> [control-dir] [--audit]
-//   bun hc.ts score  <dir> <round> [--targets id,id]
-//   bun hc.ts log    <dir> <round> <keep|revert> <what you tried>
-//   bun hc.ts status <dir>
-//   bun hc.ts noise  <dir> <roundA> <roundB>
+//   bun hc.ts prep   <dir> <round>    run gates and measures, collect evidence, write one prompt per judge
+//   bun hc.ts score  <dir> <round>    read the judges' replies and the measures, print the verdict
+//   bun hc.ts log    <dir> <round> keep|revert "<what you tried>"
+//   bun hc.ts status <dir>            where the run stands, with the score table
+//   bun hc.ts report <dir>            run the held-back measures and write report.html, before and after
 //
-// <dir> is .hillclimb/<slug>. The "control" is what a round is compared with:
-// the reference, or the best version so far when contract.json has "reference": false.
-import { execSync } from "node:child_process";
-import { appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+// <dir> is .hillclimb/<slug> and holds contract.json (see references/contract.example.json).
+// Each round is compared with the best version so far. Round 00 has nothing to be compared
+// with, so judges score it on its own.
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 
-type Label = "A" | "B";
-type Role = "artifact" | "control";
-type Mapping = { packetRoot: string; judges: Record<string, Record<Label, Role>> };
+type Side = "A" | "B";
+type Role = "new" | "best";
+type Measure = {
+  id: string;
+  cmd: string; // prints the number on its last line, or use "pattern"
+  better: "higher" | "lower";
+  target?: number;
+  slack?: number; // how much worse still counts as unchanged, for noisy numbers
+  pattern?: string; // regex with one group, when the number isn't on the last line
+  final?: boolean; // a held-back check: never run during rounds, only by `report`
+};
 type Contract = {
-  reference: boolean;
-  criteria: string[];
-  checks: string[];
-  required?: string[]; // check ids that must pass
-  judges: Record<string, string>; // judge id -> model family
-  target?: number | null; // mean of criterion medians must reach this
-  floor?: number | null; // every criterion median must reach this (default target - 1)
-  noiseFloor?: number | null; // smallest gap change that counts (default 0.5)
+  goal: string; // what judges are told the work is for, with any limits they need to know
+  reference?: string | null; // what the bar is, in words. Its files go in <dir>/reference/
+  criteria?: { id: string; means: string; levels?: string }[]; // qualities judges score from 1 to 10
+  must?: string[]; // outcomes judges confirm from the evidence, yes or no
+  gates?: string[]; // commands that must exit 0 before anything is judged
+  measures?: Measure[];
+  evidence?: string[]; // files or folders copied into each round's evidence
+  capture?: string; // command that writes more evidence into $HC_EVIDENCE
+  judges?: Record<string, string>; // judge id -> model family, such as "anthropic" or "openai"
+  single_family?: boolean; // true only when the user accepted a panel from one model family
+  target?: number;
+  floor?: number; // lowest any one criterion may score (default target - 1)
+  rounds?: number;
+  minutes?: number;
 };
-type Issue = { severity?: string; criterion?: string; evidence?: string; problem?: string };
-type Verdict = {
-  criteria?: { id: string; A?: unknown; B?: unknown; better?: string }[];
-  checks?: Partial<Record<Label, Record<string, string>>>;
-  issues?: Partial<Record<Label, Issue[]>>;
-  rubric_flags?: string[];
-  evidence_gaps?: string[];
+type Mapping = { root: string; basis: string; judges: Record<string, Partial<Record<Side, Role>>> };
+type Issue = { severity?: string; where?: string; problem?: string };
+type Reply = {
+  scores?: Record<string, Partial<Record<Side, unknown>>>;
+  better?: string;
+  must?: Partial<Record<Side, unknown[]>>;
+  issues?: Partial<Record<Side, Issue[]>>;
+  rubric?: unknown[];
 };
-type CriterionScore = { artifact: number | null; control: number | null; gap: number | null; judges: string[] };
+type Verdict = "BASELINE" | "KEEP" | "REVERT" | "TIE" | "INCOMPLETE";
 type Scores = {
-  round: string;
-  criteria: Record<string, CriterionScore>;
-  meanGap: number | null;
-  winners: Record<string, Record<string, Role | "tie">>; // criterion -> judge -> winner
-  checkFails: Record<string, string[]>;
-  toVerify: string[];
-  onControl: string[]; // judges' findings on the control side
-  rubricFlags: string[];
-  problems: string[];
+  criteria: Record<string, { new: number | null; best: number | null; gap: number | null }>;
+  mean: number | null;
+  votes: Record<Role | "tie", number>;
+  measures: Record<string, number>;
+  verdict: Verdict;
+  targetMet: boolean;
 };
-type Row = { round: string; sha: string; note: string; meanGap: string; decision: string };
+const COLS = ["round", "time", "sha", "decision", "score", "measures", "rubric", "note"] as const;
+type Row = Record<(typeof COLS)[number], string>;
 
 function die(msg: string): never {
   console.error(msg);
   process.exit(1);
 }
 
-const [cmd, dir, ...args] = process.argv.slice(2);
-if (!cmd || !dir) die("usage: bun hc.ts <pack|score|log|status|noise> <dir> ...");
+const USAGE = "usage: bun hc.ts <prep|score|log|status|report> <dir> [round] ...";
+const [cmd, dirArg, round, ...rest] = process.argv.slice(2);
+if (!cmd || !dirArg) die(USAGE);
+const dir: string = dirArg;
+const contractFile = join(dir, "contract.json");
+if (!existsSync(contractFile)) die(`no contract.json in ${dir}. Copy references/contract.example.json and fill it in.`);
 
-const targets = (() => {
-  const i = args.indexOf("--targets");
-  return i >= 0 ? (args[i + 1] ?? "").split(",").filter(Boolean) : [];
-})();
-const positional = args.filter((a, i) => !a.startsWith("--") && args[i - 1] !== "--targets");
 const readJson = <T,>(p: string): T => JSON.parse(readFileSync(p, "utf8")) as T;
-const contract = readJson<Contract>(join(dir, "contract.json"));
+const c = readJson<Contract>(contractFile);
+// A run started with the previous version of this skill keeps the helper it began with.
+const old = c as Record<string, unknown>;
+if (!c.goal && (old.checks !== undefined || typeof old.reference === "boolean")) {
+  const legacy = join(import.meta.dir, "..", "legacy", "scripts", "hc.ts");
+  if (!existsSync(legacy)) die("this run was started with an earlier version of the skill. Finish it with that version, or start a new run.");
+  if (cmd === "prep" || cmd === "report") die(`this run was started with the previous version of the skill. Keep using its commands (pack, score, log, status). Its instructions are in ${resolve(legacy, "..", "..")}.`);
+  process.exit(spawnSync("bun", [legacy, ...process.argv.slice(2)], { stdio: "inherit" }).status ?? 1);
+}
+const criteria = c.criteria ?? [];
+const measures = c.measures ?? [];
+const judges = c.judges ?? {};
+// "anthropic:claude-x" and "Anthropic" are the same family.
+const family = (j: string) => (judges[j] ?? "").toLowerCase().split(/[^a-z0-9]/)[0] ?? "";
+const needFamilies = c.single_family ? 1 : 2;
+if (!c.goal) die('contract.json needs a "goal"');
+if (!criteria.length && !measures.some((m) => !m.final)) die('contract.json needs "criteria" (judged), "measures" (commands that print a number), or both');
+if (criteria.length && (Object.keys(judges).length < 2 || new Set(Object.keys(judges).map(family)).size < needFamilies))
+  die('judged criteria need at least two "judges" from two model families. If the user accepted one family, set "single_family": true.');
+
 const rdir = (r: string) => join(dir, "rounds", r);
 const scoresFile = (r: string) => join(rdir(r), "scores.json");
-const entries = (d: string, files: boolean) =>
-  existsSync(d)
-    ? readdirSync(d)
-        .filter((f) => !f.startsWith(".") && statSync(join(d, f)).isFile() === files)
+const walk = (d: string, base = d): string[] =>
+  !existsSync(d)
+    ? []
+    : readdirSync(d)
+        .filter((f) => !f.startsWith("."))
         .sort()
-    : [];
-const isRequired = (check: string) => (contract.required ?? []).includes(check);
+        .flatMap((f) => (statSync(join(d, f)).isDirectory() ? walk(join(d, f), base) : [relative(base, join(d, f))]));
+const digest = (d: string) => {
+  const h = createHash("sha1");
+  for (const f of walk(d)) h.update(f).update(readFileSync(join(d, f)));
+  return h.digest("hex");
+};
 const median = (xs: number[]): number | null => {
   if (!xs.length) return null;
   const s = [...xs].sort((a, b) => a - b);
   const m = s.length >> 1;
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  return s.length % 2 ? (s[m] ?? null) : ((s[m - 1] ?? 0) + (s[m] ?? 0)) / 2;
 };
 const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
-const fmt = (n: number | null | undefined, signed = false) =>
-  n === null || n === undefined ? "no score" : `${signed && n > 0 ? "+" : ""}${n.toFixed(1)}`;
+const fmt = (n: number | null | undefined, signed = false) => (n == null ? "-" : `${signed && n > 0 ? "+" : ""}${Number(n.toFixed(2))}`);
+const sh = (command: string, env: Record<string, string> = {}) => {
+  const r = spawnSync("bash", ["-o", "pipefail", "-c", command], { encoding: "utf8", env: { ...process.env, ...env }, maxBuffer: 1 << 26 });
+  return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
+};
+const tail = (s: string, n = 25) => s.split("\n").slice(-n).join("\n");
+// Changes whenever what is being measured changes. Numbers from before and after don't compare.
+const rubricId = createHash("sha1").update(JSON.stringify([criteria, c.must, c.gates, measures, c.reference])).digest("hex").slice(0, 6);
 
 const histFile = join(dir, "history.tsv");
 const history = (): Row[] =>
@@ -91,331 +135,396 @@ const history = (): Row[] =>
         .split("\n")
         .slice(1)
         .filter(Boolean)
-        .map((line) => {
-          const [round = "", sha = "", note = "", meanGap = "", decision = ""] = line.split("\t");
-          return { round, sha, note, meanGap, decision };
-        })
+        .map((line) => Object.fromEntries(COLS.map((k, i) => [k, line.split("\t")[i] ?? ""])) as Row)
     : [];
 const best = () => history().findLast((r) => r.decision === "keep");
-// 03b and 03-confirm re-judge round 03's evidence.
-const baseOf = (round: string) => round.match(/^(\d+)(b|-confirm)$/)?.[1];
-// What a round's control is, in plain words.
-const controlName = (round: string) =>
-  round.endsWith("-confirm") ? "best so far" : contract.reference ? "reference" : round === "audit" ? "baseline" : "best so far";
+// Judges write their replies next to their packet. Bring them into the round folder.
+const collect = (r: string, m: Mapping) => {
+  mkdirSync(join(rdir(r), "judges"), { recursive: true });
+  for (const j of Object.keys(m.judges)) if (existsSync(join(m.root, j, "reply.md"))) cpSync(join(m.root, j, "reply.md"), join(rdir(r), "judges", `${j}.md`));
+};
+const needRound = () => round ?? die(`${cmd} needs a round, for example: bun hc.ts ${cmd} ${dir} 00`);
 
-function pack(round: string, controlArg: string | undefined, audit: boolean) {
-  const kept = best()?.round;
-  const needKept = () => kept ?? die('no kept round yet. Log the baseline first: log <dir> 00 keep "baseline"');
-  const evidence = join(rdir(round), "evidence");
-  if (!existsSync(evidence)) {
-    const from = round === "audit" ? needKept() : baseOf(round);
-    if (from) cpSync(join(rdir(from), "evidence"), evidence, { recursive: true });
+function measure(which: Measure[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const m of which) {
+    const res = sh(m.cmd);
+    if (!res.ok) die(`measure "${m.id}" failed: ${m.cmd}\n${tail(res.out)}`);
+    const hit = m.pattern ? res.out.match(new RegExp(m.pattern))?.[1] : res.out.split("\n").at(-1)?.match(/-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/i)?.[0];
+    if (hit === undefined || Number.isNaN(Number(hit))) die(`measure "${m.id}": no number in the output of ${m.cmd}. Print it on the last line, or set "pattern" to a regex with one group.`);
+    out[m.id] = Number(hit);
+    console.log(`measure ${m.id}: ${out[m.id]}`);
   }
-  const files = entries(evidence, true);
-  if (!files.length) die(`no evidence in ${evidence}`);
-  const flat = (d: string) => entries(d, false).length && die(`evidence must be flat files, but ${d} has subfolders`);
-  flat(evidence);
-
-  let controlDir = controlArg;
-  if (!controlDir) {
-    if (round.endsWith("-confirm")) controlDir = join(rdir(needKept()), "evidence");
-    else if (contract.reference) controlDir = join(dir, "reference");
-    else controlDir = join(rdir(round === "audit" ? "00" : needKept()), "evidence");
-  }
-  flat(controlDir);
-  const control = entries(controlDir, true);
-  if (control.join("\n") !== files.join("\n"))
-    die(`both sides need the same file names\n  this round: ${files.join(", ")}\n  control (${controlDir}): ${control.join(", ")}`);
-
-  // A neutral location, so paths reveal nothing about the project, the round, or which side is which.
-  const packetRoot = mkdtempSync(join(tmpdir(), "hc-"));
-  const ids = audit ? ["AUD1", "AUD2"] : Object.keys(contract.judges);
-  const offset = Math.random() < 0.5 ? 0 : 1; // orders alternate across judges from a random start
-  // Packing a round again keeps its A/B order, so replies already saved still score correctly.
-  const mapFile = join(rdir(round), "mapping.json");
-  const old = existsSync(mapFile) ? readJson<Mapping>(mapFile).judges : {};
-  const mapping: Mapping = { packetRoot, judges: {} };
-  ids.forEach((judge, i) => {
-    const roles: Record<Label, Role> =
-      old[judge] ?? ((i + offset) % 2 === 0 ? { A: "artifact", B: "control" } : { A: "control", B: "artifact" });
-    mapping.judges[judge] = roles;
-    for (const label of ["A", "B"] as const) {
-      const out = join(packetRoot, judge, label);
-      mkdirSync(out, { recursive: true });
-      const src = roles[label] === "artifact" ? evidence : controlDir;
-      for (const f of files) copyFileSync(join(src, f), join(out, f));
-    }
-  });
-  writeFileSync(mapFile, `${JSON.stringify(mapping, null, 2)}\n`);
-  for (const judge of ids) console.log(`${judge}: A=${join(packetRoot, judge, "A")}  B=${join(packetRoot, judge, "B")}`);
-  console.log(`files on each side: ${files.join(", ")}`);
-  console.log(`save each reply to ${join(rdir(round), "judges")}/<judge>.md`);
-}
-
-function parseVerdict(text: string): Verdict {
-  const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
-  return JSON.parse(blocks.length ? blocks[blocks.length - 1][1] : text) as Verdict;
-}
-
-function score(round: string): Scores {
-  const mapping = readJson<Mapping>(join(rdir(round), "mapping.json"));
-  const out: Scores = { round, criteria: {}, meanGap: null, winners: {}, checkFails: {}, toVerify: [], onControl: [], rubricFlags: [], problems: [] };
-  const rows: Record<string, { judge: string; artifact: number | null; control: number | null }[]> = {};
-
-  for (const [judge, roles] of Object.entries(mapping.judges)) {
-    const file = join(rdir(round), "judges", `${judge}.md`);
-    if (!existsSync(file)) {
-      out.problems.push(`${judge}: no reply file`);
-      continue;
-    }
-    let v: Verdict;
-    try {
-      v = parseVerdict(readFileSync(file, "utf8"));
-    } catch {
-      out.problems.push(`${judge}: no valid JSON block (rerun this judge once)`);
-      continue;
-    }
-    const labelOf = (role: Role): Label => (roles.A === role ? "A" : "B");
-    const num = (id: string, s: unknown): number | null => {
-      if (s === null || s === undefined) return null;
-      if (typeof s === "number" && s >= 1 && s <= 10) return s;
-      out.problems.push(`${judge}/${id}: invalid score ${JSON.stringify(s)}`);
-      return null;
-    };
-    const seen = new Set<string>();
-    for (const c of v.criteria ?? []) {
-      if (!contract.criteria.includes(c.id)) {
-        out.problems.push(`${judge}: unknown criterion "${c.id}"`);
-        continue;
-      }
-      seen.add(c.id);
-      (rows[c.id] ??= []).push({ judge, artifact: num(c.id, c[labelOf("artifact")]), control: num(c.id, c[labelOf("control")]) });
-      if (c.better === "A" || c.better === "B") (out.winners[c.id] ??= {})[judge] = roles[c.better];
-      else if (c.better === "tie") (out.winners[c.id] ??= {})[judge] = "tie";
-    }
-    for (const id of contract.criteria) if (!seen.has(id)) out.problems.push(`${judge}: missing criterion "${id}"`);
-    const checks = v.checks?.[labelOf("artifact")] ?? {};
-    for (const id of contract.checks) {
-      if (checks[id] === undefined) out.problems.push(`${judge}: missing check "${id}"`);
-      else if (checks[id] === "FAIL") {
-        (out.checkFails[id] ??= []).push(judge);
-        if (isRequired(id)) out.toVerify.push(`[required check] ${judge} ${id}: FAIL`);
-      }
-    }
-    for (const flag of v.rubric_flags ?? []) out.rubricFlags.push(`${judge}: ${flag}`);
-    for (const gap of v.evidence_gaps ?? []) out.problems.push(`${judge} couldn't open: ${gap}`);
-    for (const issue of v.issues?.[labelOf("control")] ?? [])
-      if (issue.severity !== "nit")
-        out.onControl.push(`[${issue.severity ?? "?"}] ${judge} ${issue.criterion ?? "?"}: ${issue.problem ?? ""} (where: ${issue.evidence ?? "not given"})`);
-    for (const issue of v.issues?.[labelOf("artifact")] ?? [])
-      if (issue.severity === "blocker" || issue.severity === "high")
-        out.toVerify.push(`[${issue.severity}] ${judge} ${issue.criterion ?? "?"}: ${issue.problem ?? ""} (where: ${issue.evidence ?? "not given"})`);
-  }
-
-  const audit = round === "audit";
-  for (const id of contract.criteria) {
-    const r = rows[id] ?? [];
-    const paired = r.flatMap((x) => (x.artifact !== null && x.control !== null ? [{ judge: x.judge, gap: x.artifact - x.control }] : []));
-    const families = new Set(paired.map((p) => contract.judges[p.judge] ?? "unknown")).size;
-    // A criterion counts only when two judges from two model families scored both sides.
-    const quorum = audit ? paired.length > 0 : paired.length >= 2 && families >= 2;
-    if (!quorum) out.problems.push(`${id}: not enough judges (${paired.length} scored both sides, ${families} families)`);
-    for (const side of ["artifact", "control"] as const) {
-      const xs = r.flatMap((x) => (x[side] === null ? [] : [x[side]]));
-      if (xs.length && Math.max(...xs) - Math.min(...xs) > 3)
-        out.problems.push(`${id}: judges split on ${side === "artifact" ? "yours" : `the ${controlName(round)}`} (${xs.join(", ")}). The criterion may be vague.`);
-    }
-    out.criteria[id] = {
-      artifact: median(r.flatMap((x) => (x.artifact === null ? [] : [x.artifact]))),
-      control: median(r.flatMap((x) => (x.control === null ? [] : [x.control]))),
-      gap: quorum ? median(paired.map((p) => p.gap)) : null, // median of each judge's own artifact-minus-control
-      judges: paired.map((p) => p.judge),
-    };
-  }
-  const gaps = contract.criteria.map((id) => out.criteria[id].gap);
-  out.meanGap = gaps.every((g): g is number => g !== null) ? mean(gaps) : null;
-  writeFileSync(scoresFile(round), `${JSON.stringify(out, null, 2)}\n`);
   return out;
 }
 
-function report(s: Scores) {
-  const w = Math.max(9, ...contract.criteria.map((c) => c.length));
-  console.log(`${"criterion".padEnd(w)}  yours     ${controlName(s.round).padEnd(11)}  gap       judges`);
-  for (const id of contract.criteria) {
-    const c = s.criteria[id];
-    console.log(`${id.padEnd(w)}  ${fmt(c.artifact).padEnd(8)}  ${fmt(c.control).padEnd(11)}  ${fmt(c.gap, true).padEnd(8)}  ${c.judges.join(",")}`);
-  }
-  console.log(`mean gap: ${fmt(s.meanGap, true)}`);
-  const section = (title: string, lines: string[]) => lines.length && console.log(`\n${title}\n${lines.map((l) => `- ${l}`).join("\n")}`);
-  section(
-    "failed checks on your side:",
-    Object.entries(s.checkFails).map(([id, js]) => `${id}${isRequired(id) ? " [required]" : ""}: ${js.join(", ")}`),
-  );
-  section("check these against the evidence yourself before deciding:", s.toVerify);
-  if (controlName(s.round) === "best so far") section("problems judges found in the best version so far:", s.onControl);
-  section("judges' doubts about the rubric:", s.rubricFlags);
-  section("problems:", s.problems);
+function prompt(folder: string, sides: Partial<Record<Side, Role>>, files: string[], bar: string[]): string {
+  const solo = !sides.B;
+  const template = readFileSync(join(import.meta.dir, "..", "references", "judge-prompt.md"), "utf8").split(/^---$/m).slice(1).join("---").trim();
+  const both = (x: string) => (solo ? `{ "A": ${x} }` : `{ "A": ${x}, "B": ${x} }`);
+  const fill: Record<string, string> = {
+    goal: c.goal,
+    rubric: [
+      ...criteria.map((x) => `### ${x.id}\n${x.means}${x.levels ? `\n${x.levels}` : ""}`),
+      ...(c.must?.length ? [`### Must be true\n${c.must.map((m, i) => `${i + 1}. ${m}`).join("\n")}`] : []),
+    ].join("\n\n"),
+    folders: [
+      solo ? `The work: ${join(folder, "A")}` : `A: ${join(folder, "A")}\nB: ${join(folder, "B")}`,
+      `Files: ${files.join(", ")}`,
+      ...(bar.length ? [`The bar: ${join(folder, "bar")} (${c.reference ?? "the standard this work is aiming for"}). Files: ${bar.join(", ")}`] : []),
+    ].join("\n"),
+    task: solo ? "Score the work on each criterion." : "A and B are two versions of the same work. Score both on each criterion, then say which one you would ship overall.",
+    scale: `A 9 means an expert in this field would ship it as it is${bar.length ? " and it is at least level with the bar on that criterion" : ""}. A 10 means you can't name a change a user would notice.`,
+    shape: [
+      "{",
+      `  "scores": { ${criteria.map((x) => `"${x.id}": ${both("7").replace(" }", ', "why": "one sentence" }')}`).join(",\n              ")} },`,
+      ...(solo ? [] : ['  "better": "A" | "B" | "tie",']),
+      ...(c.must?.length ? [`  "must": ${both(`[${c.must.map(() => '"yes" | "no" | "unknown"').join(", ")}]`)},`] : []),
+      `  "issues": ${both('[{ "severity": "blocker" | "high" | "medium" | "low", "where": "file and place", "problem": "what is wrong and what it costs the user" }]')},`,
+      '  "rubric": ["anything the rubric or the evidence gets wrong or cannot show"],',
+      '  "model": "the model you are, if you know"',
+      "}",
+    ].join("\n"),
+    reply: join(folder, "reply.md"),
+  };
+  return template.replace(/\{\{(\w+)\}\}/g, (_, k: string) => fill[k] ?? "");
 }
 
-function auditVerdicts(s: Scores) {
-  console.log("\naudit, judged in both orders:");
-  for (const id of contract.criteria) {
-    const a = s.winners[id]?.AUD1;
-    const b = s.winners[id]?.AUD2;
-    const who = (r: Role | "tie") => (r === "artifact" ? "yours" : r === "control" ? controlName("audit") : r);
-    console.log(`- ${id}: ${!a || !b ? "missing" : a === b ? who(a) : "flips with the order (unresolved)"}`);
+function prep(r: string) {
+  mkdirSync(rdir(r), { recursive: true });
+  const head = sh("git rev-parse --short HEAD");
+  writeFileSync(join(rdir(r), "sha"), head.ok ? head.out : "-");
+  for (const g of c.gates ?? []) {
+    const res = sh(g);
+    if (!res.ok) die(`gate failed: ${g}\n${tail(res.out)}\n\nFix the work, not the gate.`);
+    console.log(`gate ok: ${g}`);
   }
+  writeFileSync(join(rdir(r), "measures.json"), `${JSON.stringify(measure(measures.filter((m) => !m.final)), null, 2)}\n`);
+  if (!criteria.length) return console.log(`nothing for judges here. Next: score ${r}`);
+
+  // Evidence is collected again on every prep, so judges never see an older version of the work.
+  const evidence = join(rdir(r), "evidence");
+  if (c.evidence?.length || c.capture) {
+    rmSync(evidence, { recursive: true, force: true });
+    mkdirSync(evidence, { recursive: true });
+    for (const p of c.evidence ?? []) {
+      if (!existsSync(p)) die(`evidence not found: ${p}`);
+      if (existsSync(join(evidence, basename(p)))) die(`two evidence entries are both named ${basename(p)}. Rename one, or collect them with "capture".`);
+      cpSync(p, join(evidence, basename(p)), { recursive: true });
+    }
+    const res = c.capture ? sh(c.capture, { HC_EVIDENCE: resolve(evidence), HC_ROUND: r }) : null;
+    if (res && !res.ok) die(`capture failed: ${c.capture}\n${tail(res.out)}`);
+  }
+  const files = walk(evidence);
+  if (!files.length) die(`no evidence. List files under "evidence" in contract.json, set "capture", or put files in ${evidence}.`);
+
+  const kept = best();
+  const bestDir = kept && kept.round !== r ? join(rdir(kept.round), "evidence") : null;
+  if (bestDir && digest(bestDir) === digest(evidence))
+    die(`round ${r}'s evidence is identical to round ${kept?.round}'s, so judges would have nothing to compare. Collect evidence that shows what you changed.`);
+
+  const mapFile = join(rdir(r), "mapping.json");
+  let old = existsSync(mapFile) ? readJson<Mapping>(mapFile) : null;
+  const replies = join(rdir(r), "judges");
+  if (old) collect(r, old);
+  const bar = walk(join(dir, "reference"));
+  // Everything a judge was shown. If any of it changes, earlier replies no longer apply.
+  const basis = [digest(evidence), bestDir ? digest(bestDir) : "", digest(join(dir, "reference")), rubricId, c.goal].join("|");
+  if (old && old.basis !== basis) {
+    if (walk(replies).length) {
+      renameSync(replies, `${replies}-stale-${Date.now()}`);
+      console.log("the evidence or the rubric changed since judges last saw this round, so their replies were set aside. Call them again.");
+    }
+    old = null;
+  }
+  // A neutral location, so paths say nothing about the project, the round, or which side is new.
+  const root = mkdtempSync(join(tmpdir(), "hc-"));
+  const mapping: Mapping = { root, basis, judges: {} };
+  const flip = Math.random() < 0.5 ? 0 : 1;
+  Object.keys(judges).forEach((j, i) => {
+    // Orders alternate across judges. Running prep again keeps each judge's order, so saved replies still score.
+    const sides: Partial<Record<Side, Role>> = old?.judges[j] ?? (!bestDir ? { A: "new" } : (i + flip) % 2 ? { A: "best", B: "new" } : { A: "new", B: "best" });
+    mapping.judges[j] = sides;
+    const folder = join(root, j);
+    for (const s of ["A", "B"] as const) {
+      const from = sides[s] === "new" ? evidence : sides[s] === "best" ? bestDir : null;
+      if (from) cpSync(from, join(folder, s), { recursive: true });
+    }
+    if (bar.length) cpSync(join(dir, "reference"), join(folder, "bar"), { recursive: true });
+    writeFileSync(join(folder, "prompt.md"), prompt(folder, sides, walk(join(folder, "A")), bar));
+    console.log(`${j} (${family(j)}): ${join(folder, "prompt.md")}`);
+  });
+  writeFileSync(mapFile, `${JSON.stringify(mapping, null, 2)}\n`);
+  console.log(`\nGive each judge its prompt file and nothing else, each in a fresh context, all at once. Then: score ${r}`);
 }
 
-// Compare this round's gaps with the best round's. When the control already is the best
-// version (no reference, or a confirm round), the baseline is a gap of zero.
-function decide(now: Scores, prev: Scores | null) {
-  const floor = contract.noiseFloor ?? 0.5;
-  for (const t of targets) if (!contract.criteria.includes(t)) die(`unknown target "${t}"`);
-  const reasons: string[] = [];
-  let close = false;
-  for (const id of contract.criteria) {
-    const g = now.criteria[id].gap;
-    const base = prev ? prev.criteria[id]?.gap : 0;
-    if (g === null || base === null || base === undefined) {
-      reasons.push(`${id}: nothing to compare`);
+function score(r: string): Scores {
+  const kept = best();
+  const solo = !kept || kept.round === r;
+  const mapping = criteria.length ? readJson<Mapping>(join(rdir(r), "mapping.json")) : { root: "", basis: "", judges: {} };
+  const rows: Record<string, { j: string; new: number; best: number | null }[]> = {};
+  const votes: Scores["votes"] = { new: 0, best: 0, tie: 0 };
+  const forNew = new Set<string>(); // model families with a judge who would ship the new version
+  const findings: string[] = [];
+  const onBest: string[] = [];
+  const doubts: string[] = [];
+  const problems: string[] = [];
+  const mustYes: number[] = [];
+  const mustYesBest: number[] = [];
+  let replied = 0;
+  collect(r, mapping);
+
+  for (const [j, sides] of Object.entries(mapping.judges)) {
+    const saved = join(rdir(r), "judges", `${j}.md`);
+    if (!existsSync(saved)) {
+      problems.push(`${j}: no reply yet (expected at ${join(mapping.root, j, "reply.md")})`);
       continue;
     }
-    const d = g - base;
-    if (targets.includes(id) && d < floor) reasons.push(`${id}: targeted, moved ${fmt(d, true)}, needs +${floor.toFixed(1)}`);
-    if (d < -floor) reasons.push(`${id}: got worse by ${fmt(-d)}`);
-    if ((targets.includes(id) && Math.abs(d - floor) < 0.5) || Math.abs(d + floor) < 0.5) close = true;
-    if (Math.abs(d) > 2) console.log(`\nsuspect: ${id} moved ${fmt(d, true)} in one round. Confirm your change explains it.`);
-  }
-  const baseMean = prev ? prev.meanGap : 0;
-  if (now.meanGap === null || baseMean === null) reasons.push("mean gap unavailable");
-  else if (now.meanGap < baseMean) reasons.push(`mean gap fell ${fmt(baseMean, true)} -> ${fmt(now.meanGap, true)}`);
-  else if (!targets.length && now.meanGap === baseMean) reasons.push("no improvement");
-  console.log(`\n${reasons.length ? `REVERT\n- ${reasons.join("\n- ")}` : "KEEP, unless you confirmed a blocker or a new required-check failure"}`);
-  if (close && prev) console.log("close call: see references/extras.md before deciding");
-}
-
-// Where this round stands against the stop conditions.
-function standing(now: Scores) {
-  if (contract.reference && now.round !== "audit") {
-    const r0 = now.round !== "00" && existsSync(scoresFile("00")) ? readJson<Scores>(scoresFile("00")) : null;
-    for (const id of contract.criteria) {
-      const was = r0?.criteria[id]?.control;
-      const is = now.criteria[id].control;
-      if (was != null && is != null && Math.abs(is - was) > 1)
-        console.log(`drift: judges now score the reference's ${id} at ${fmt(is)}, it was ${fmt(was)} in round 0`);
+    let v: Reply;
+    try {
+      const text = readFileSync(saved, "utf8");
+      v = JSON.parse([...text.matchAll(/```json\s*\n([\s\S]*?)```/g)].at(-1)?.[1] ?? text) as Reply;
+    } catch {
+      problems.push(`${j}: reply has no valid JSON block. Rerun this judge once.`);
+      continue;
     }
-    const parity = now.meanGap !== null && now.meanGap >= 0 && contract.criteria.every((id) => (now.criteria[id].gap ?? -99) >= -0.5);
-    console.log(`parity: ${parity ? "yes" : "no"}`);
+    replied++;
+    const sideOf = (role: Role) => (["A", "B"] as const).find((s) => sides[s] === role);
+    const num = (id: string, role: Role): number | null => {
+      const s = sideOf(role);
+      const x = s ? v.scores?.[id]?.[s] : undefined;
+      if (typeof x === "number" && x >= 1 && x <= 10) return x;
+      if (x != null) problems.push(`${j}: bad score for ${id}: ${JSON.stringify(x)}`);
+      return null;
+    };
+    // A judge may leave out a score the evidence can't support. Its other answers still count.
+    for (const x of criteria) {
+      const mine = { j, new: num(x.id, "new"), best: num(x.id, "best") };
+      if (mine.new !== null && (solo || mine.best !== null)) (rows[x.id] ??= []).push({ ...mine, new: mine.new });
+    }
+    if (!solo) {
+      const pick = v.better === "A" || v.better === "B" ? sides[v.better] : v.better === "tie" ? "tie" : undefined;
+      if (pick === "new") forNew.add(family(j));
+      if (pick) votes[pick]++;
+      else problems.push(`${j}: no overall "better"`);
+    }
+    const from = <T,>(role: Role, by?: Partial<Record<Side, T[]>>): T[] => {
+      const s = sideOf(role);
+      return (s ? by?.[s] : undefined) ?? [];
+    };
+    (c.must ?? []).forEach((text, i) => {
+      const a = from("new", v.must)[i];
+      if (from("best", v.must)[i] === "yes") mustYesBest[i] = (mustYesBest[i] ?? 0) + 1;
+      if (a === "yes") mustYes[i] = (mustYes[i] ?? 0) + 1;
+      else findings.push(`[must] ${j} ${a === "no" ? "says no" : "can't tell from the evidence"}${a === "no" && from("best", v.must)[i] === "no" ? " (also no for the best version)" : ""}: ${text}`);
+    });
+    const list = (role: Role) => from(role, v.issues).filter((x) => x.severity !== "low").map((x) => `[${x.severity}] ${j}: ${x.problem ?? ""} (${x.where ?? "place not given"})`);
+    findings.push(...list("new"));
+    onBest.push(...list("best"));
+    for (const d of v.rubric ?? []) doubts.push(`${j}: ${typeof d === "string" ? d : JSON.stringify(d)}`);
   }
-  const t = contract.target;
-  if (t != null) {
-    const f = contract.floor ?? t - 1;
-    const medians = contract.criteria.map((id) => now.criteria[id].artifact);
-    const met = medians.every((m): m is number => m !== null) && mean(medians) >= t && medians.every((m) => m >= f);
-    console.log(`target ${t}, every criterion at least ${f}: ${met ? "met" : "not met"}`);
+
+  const out: Scores = { criteria: {}, mean: null, votes, measures: {}, verdict: "INCOMPLETE", targetMet: false };
+  const thin: string[] = []; // criteria without two judges from enough families
+  for (const x of criteria) {
+    const got = rows[x.id] ?? [];
+    if (got.length < 2 || new Set(got.map((g) => family(g.j))).size < needFamilies) thin.push(x.id);
+    for (const role of ["new", "best"] as const) {
+      const xs = got.flatMap((g) => (g[role] === null ? [] : [g[role]]));
+      if (xs.length && Math.max(...xs) - Math.min(...xs) > 3) problems.push(`${x.id}: judges split on ${role === "new" ? "this round" : "the best version"} (${xs.join(", ")}). The criterion may be vague.`);
+    }
+    out.criteria[x.id] = {
+      new: median(got.map((g) => g.new)),
+      best: median(got.flatMap((g) => (g.best === null ? [] : [g.best]))),
+      gap: median(got.flatMap((g) => (g.best === null ? [] : [g.new - g.best]))), // each judge's own new-minus-best, so one harsh judge doesn't distort it
+    };
   }
+  const medians = criteria.map((x) => out.criteria[x.id]?.new ?? null);
+  if (criteria.length && medians.every((m): m is number => m !== null)) out.mean = mean(medians);
+
+  const measureFile = join(rdir(r), "measures.json");
+  if (measures.length) out.measures = existsSync(measureFile) ? readJson<Record<string, number>>(measureFile) : die(`no measures for round ${r}. Run: prep ${r}`);
+  const sameRuler = solo || kept?.rubric === rubricId;
+  const prevFile = !solo && sameRuler && kept ? join(rdir(kept.round), "measures.json") : null;
+  const prev = prevFile && existsSync(prevFile) ? readJson<Record<string, number>>(prevFile) : null;
+  const moved = measures.filter((m) => !m.final).map((m) => {
+    const now = out.measures[m.id];
+    const was = prev?.[m.id];
+    const d = now === undefined || was === undefined ? 0 : (now - was) * (m.better === "lower" ? -1 : 1);
+    return { m, now, was, worse: d < -(m.slack ?? 0), better: d > (m.slack ?? 0) };
+  });
+
+  const why: string[] = [];
+  const notes: string[] = [];
+  // A must counts as true only when most of the judges who replied could confirm it.
+  const confirmed = (yes: number[], i: number) => (yes[i] ?? 0) * 2 > replied;
+  const musts = c.must ?? [];
+  const mustOpen = musts.filter((_, i) => !confirmed(mustYes, i));
+  const gapOf = (id: string) => out.criteria[id]?.gap ?? 0;
+  if (thin.length) why.push(`${thin.join(", ")}: needs scores from at least two judges${needFamilies > 1 ? " in two model families" : ""}`);
+  else if (solo) out.verdict = "BASELINE";
+  else {
+    for (const x of moved.filter((y) => y.worse)) why.push(`${x.m.id} got worse: ${x.was} -> ${x.now}`);
+    musts.forEach((text, i) => {
+      if (confirmed(mustYesBest, i) && !confirmed(mustYes, i)) why.push(`a must that held for the best version no longer does: ${text}`);
+      if (!confirmed(mustYesBest, i) && confirmed(mustYes, i)) notes.push(`this round makes a must true that the best version fails: ${text}`);
+    });
+    if (mustOpen.length) notes.push(`${mustOpen.length} must still not confirmed. Fix that next: the target can't be met without it.`);
+    // Judges weigh trade-offs when they say which they would ship, so a one-point drop is a warning and two is a revert.
+    for (const x of criteria) {
+      if (gapOf(x.id) <= -2) why.push(`${x.id} fell by ${fmt(-gapOf(x.id))}`);
+      else if (gapOf(x.id) <= -1) notes.push(`${x.id} fell by ${fmt(-gapOf(x.id))}. If you keep the round, say in the log why that's worth it.`);
+    }
+    const improved = moved.some((x) => x.better);
+    if (why.length) out.verdict = "REVERT";
+    else if (!criteria.length) out.verdict = improved ? "KEEP" : "TIE";
+    else if (votes.best > votes.new) {
+      out.verdict = "REVERT";
+      why.push("more judges would ship the best version so far");
+    } else if (votes.new > votes.best && forNew.size >= needFamilies) out.verdict = "KEEP";
+    else {
+      out.verdict = improved ? "KEEP" : "TIE";
+      if (votes.new > votes.best) why.push("only one model family would ship the new version");
+    }
+  }
+
+  const t = c.target;
+  const floor = c.floor ?? (t === undefined ? undefined : t - 1);
+  const scoreMet = !criteria.length || t === undefined || (out.mean !== null && out.mean >= t && medians.every((m) => m !== null && m >= (floor ?? 0)));
+  const measureMet = moved.every((x) => x.m.target === undefined || (x.now !== undefined && (x.m.better === "lower" ? x.now <= x.m.target : x.now >= x.m.target)));
+  const hasTarget = (criteria.length > 0 && t !== undefined) || moved.some((x) => x.m.target !== undefined);
+  out.targetMet = hasTarget && !thin.length && scoreMet && measureMet && !mustOpen.length;
+  writeFileSync(scoresFile(r), `${JSON.stringify(out, null, 2)}\n`);
+
+  if (criteria.length) {
+    const w = Math.max(9, ...criteria.map((x) => x.id.length));
+    console.log(`${"criterion".padEnd(w)}  ${solo ? "score" : "new    best   gap"}`);
+    for (const x of criteria) {
+      const s = out.criteria[x.id];
+      console.log(`${x.id.padEnd(w)}  ${solo ? fmt(s?.new) : `${fmt(s?.new).padEnd(5)}  ${fmt(s?.best).padEnd(5)}  ${fmt(s?.gap, true)}`}`);
+    }
+    console.log(`mean: ${fmt(out.mean)}${solo ? "" : `   would ship: new ${votes.new}, best ${votes.best}, tie ${votes.tie}`}`);
+  }
+  for (const x of moved) console.log(`measure ${x.m.id}: ${x.now}${x.was === undefined ? "" : ` (best so far ${x.was})`}${x.m.target === undefined ? "" : `, target ${x.m.target}`}`);
+  if (!sameRuler) console.log("the criteria, gates or measures changed since the best round, so its measures aren't compared with this round's");
+  const section = (title: string, lines: string[]) => lines.length && console.log(`\n${title}\n${lines.map((l) => `- ${l}`).join("\n")}`);
+  const serious = (l: string) => /^\[(must|blocker|high)\]/.test(l);
+  section(solo ? "findings to plan from (check each against the evidence first):" : "findings on this round. Check the first group against the evidence before you keep it:", [...findings.filter(serious), ...findings.filter((l) => !serious(l))]);
+  if (!solo) section("findings on the best version so far:", onBest);
+  section("judges' doubts about the rubric or the evidence:", doubts);
+  section("problems:", problems);
+  const advice = out.verdict === "KEEP" && criteria.length ? ", unless you confirm a blocker or a must that is now false" : out.verdict === "TIE" ? ": keep it only if it fixes something you confirmed, and say what in the log" : "";
+  console.log(`\n${out.verdict}${advice}${[...why, ...notes].map((l) => `\n- ${l}`).join("")}`);
+  if (criteria.length && c.single_family) console.log("note: every judge is from one model family, so they share blind spots");
+  if (hasTarget) console.log(`target: ${out.targetMet ? "met" : "not met"}${t !== undefined && criteria.length ? ` (mean ${fmt(out.mean)} of ${t}, lowest ${fmt(Math.min(...medians.map((m) => m ?? 0)))} of ${floor})` : ""}${mustOpen.length ? `, ${mustOpen.length} must not confirmed` : ""}`);
+  return out;
 }
 
-function log(round: string, decision: string, note: string) {
-  if (decision !== "keep" && decision !== "revert") die('usage: log <dir> <round> <keep|revert> "<what you tried>"');
-  if (history().some((r) => r.round === round)) die(`round ${round} is already logged`);
-  let sha = "-";
-  try {
-    sha = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
-  } catch {}
-  const gap = existsSync(scoresFile(round)) ? fmt(readJson<Scores>(scoresFile(round)).meanGap, true) : "-";
-  if (!existsSync(histFile)) writeFileSync(histFile, "round\tsha\tnote\tmean_gap\tdecision\n");
-  appendFileSync(histFile, `${[round, sha, note.replace(/\s+/g, " ").trim() || "-", gap, decision].join("\t")}\n`);
-  console.log(`logged round ${round}: ${decision}`);
-  if (decision === "revert") console.log("if you committed this round, undo it so the working tree is the best version again: git revert --no-edit HEAD");
+function log(r: string, decision: string, note: string) {
+  if (decision !== "keep" && decision !== "revert") die('usage: log <dir> <round> keep|revert "<what you tried>"');
+  if (history().some((x) => x.round === r)) die(`round ${r} is already logged`);
+  const s = existsSync(scoresFile(r)) ? readJson<Scores>(scoresFile(r)) : null;
+  if (decision === "keep" && (!s || s.verdict === "INCOMPLETE")) die(`round ${r} has no complete score, so it can't be kept. Run: score ${r}`);
+  // The table shows when a decision went beyond or against the verdict.
+  const against = (decision === "keep" && (s?.verdict === "TIE" || s?.verdict === "REVERT")) || (decision === "revert" && s?.verdict === "KEEP");
+  const shaFile = join(rdir(r), "sha");
+  const row: Row = {
+    round: r,
+    time: new Date().toISOString().slice(0, 16),
+    sha: existsSync(shaFile) ? readFileSync(shaFile, "utf8").trim() : "-",
+    decision,
+    score: fmt(s?.mean),
+    measures: Object.entries(s?.measures ?? {}).map(([k, v]) => `${k}=${v}`).join(" ") || "-",
+    rubric: rubricId,
+    note: `${against ? `[verdict was ${s?.verdict}] ` : ""}${note.replace(/\s+/g, " ").trim() || "-"}`,
+  };
+  if (!existsSync(histFile)) writeFileSync(histFile, `${COLS.join("\t")}\n`);
+  appendFileSync(histFile, `${COLS.map((k) => row[k]).join("\t")}\n`);
+  console.log(`logged round ${r}: ${decision}`);
+  if (decision === "revert") console.log("Put the work back to the best version before the next round (git revert --no-edit HEAD if you committed).");
+  status();
+}
+
+function table(): string {
+  const rows = history();
+  const shown = measures.filter((m) => !m.final);
+  const changed = (i: number) => i > 0 && rows[i - 1]?.rubric !== rows[i]?.rubric;
+  const head = ["round", "decision", "mean", ...criteria.map((x) => x.id), ...shown.map((m) => m.id), "what was tried"];
+  const lines = rows.map((row, i) => {
+    const s = existsSync(scoresFile(row.round)) ? readJson<Scores>(scoresFile(row.round)) : null;
+    return [`${row.round}${changed(i) ? " *" : ""}`, row.decision, fmt(s?.mean), ...criteria.map((x) => fmt(s?.criteria[x.id]?.new)), ...shown.map((m) => fmt(s?.measures[m.id])), row.note];
+  });
+  const md = [head, head.map(() => "---"), ...lines].map((l) => `| ${l.join(" | ")} |`).join("\n");
+  return rows.some((_, i) => changed(i)) ? `${md}\n\n\\* The criteria, gates or measures changed here. Scores before and after don't compare.` : md;
 }
 
 function status() {
   const rows = history();
   const kept = best();
-  const rounds = entries(join(dir, "rounds"), false).filter((r) => /^\d+$/.test(r));
   let reverts = 0;
-  for (const r of rows.toReversed()) {
-    if (r.decision !== "revert") break;
+  for (const row of rows.toReversed()) {
+    if (row.decision !== "revert") break;
     reverts++;
   }
-  console.log(kept ? `best so far: round ${kept.round} (${kept.sha}), mean gap ${kept.meanGap}` : "best so far: none yet, round 0 isn't logged");
-  console.log(`reverts in a row: ${reverts}${reverts >= 3 ? ". Stop with PLATEAU." : reverts === 2 ? ". Check that the remaining gaps are real before another round." : ""}`);
-  const last = rounds.at(-1);
-  if (last && !rows.some((r) => r.round === last)) {
-    const replies = entries(join(rdir(last), "judges"), true).length;
-    const has = (p: string) => (existsSync(join(rdir(last), p)) ? "yes" : "no");
-    console.log(`unfinished: round ${last} (evidence ${has("evidence")}, packed ${has("mapping.json")}, replies ${replies}, scored ${has("scores.json")})`);
-  } else console.log(`next round: ${String(last ? Number(last) + 1 : 0).padStart(2, "0")}`);
-
-  const scored = rounds.filter((r) => existsSync(scoresFile(r)));
-  if (!scored.length) return;
-  const all = scored.map((r) => readJson<Scores>(scoresFile(r)));
-  const reverted = new Set(rows.filter((r) => r.decision === "revert").map((r) => r.round));
-  const head = scored.map((r) => `R${Number(r)}${reverted.has(r) ? " (reverted)" : ""}`);
-  // The reference and gap columns describe the best round. Without a reference each round has
-  // a different control, so only your own scores are comparable across rounds.
-  const bestScores = contract.reference && kept && existsSync(scoresFile(kept.round)) ? readJson<Scores>(scoresFile(kept.round)) : null;
-  const tail = (cells: string[]) => (bestScores ? ` ${cells.join(" | ")} |` : "");
-  console.log(`\n| Criterion | ${head.join(" | ")} |${tail(["Reference", `Gap (R${Number(kept?.round)})`])}`);
-  console.log(`| --- |${" --- |".repeat(scored.length + (bestScores ? 2 : 0))}`);
-  for (const id of contract.criteria)
-    console.log(`| ${id} | ${all.map((s) => fmt(s.criteria[id]?.artifact)).join(" | ")} |${tail([fmt(bestScores?.criteria[id]?.control), fmt(bestScores?.criteria[id]?.gap, true)])}`);
-  console.log(`| mean gap | ${all.map((s) => fmt(s.meanGap, true)).join(" | ")} |${tail(["", fmt(bestScores?.meanGap, true)])}`);
+  const minutes = Math.round((Date.now() - statSync(contractFile).birthtimeMs) / 60000); // since the contract was written
+  const bestScores = kept && existsSync(scoresFile(kept.round)) ? readJson<Scores>(scoresFile(kept.round)) : null;
+  console.log(kept ? `\nbest so far: round ${kept.round} (${kept.sha})${bestScores?.targetMet ? ", target met" : ""}` : "\nnothing logged yet. Start with round 00.");
+  console.log(`rounds after 00: ${rows.filter((row) => row.round !== "00").length}${c.rounds ? ` of ${c.rounds}` : ""}   reverts in a row: ${reverts}   minutes so far: ${minutes}${c.minutes ? ` of ${c.minutes}` : ""}`);
+  const next = String(rows.length ? Math.max(...rows.map((row) => Number.parseInt(row.round, 10) || 0)) + 1 : 0).padStart(2, "0");
+  const open = walk(join(dir, "rounds")).map((f) => f.split("/")[0] ?? "").find((r) => !rows.some((row) => row.round === r));
+  console.log(open ? `unfinished: round ${open}` : `next round: ${next}`);
+  if (rows.length) console.log(`\n${table()}`);
 }
 
-function noise(a: string, b: string) {
-  const A = readJson<Scores>(scoresFile(a));
-  const B = readJson<Scores>(scoresFile(b));
-  let max = 0;
-  for (const id of contract.criteria) {
-    const x = A.criteria[id]?.gap;
-    const y = B.criteria[id]?.gap;
-    if (x == null || y == null) {
-      console.log(`${id}: missing in one run`);
-      continue;
-    }
-    max = Math.max(max, Math.abs(x - y));
-    console.log(`${id}: ${fmt(x, true)} vs ${fmt(y, true)}`);
-  }
-  console.log(`set "noiseFloor": ${Math.max(0.5, max).toFixed(1)} in contract.json${max > 1 ? ". Above 1 the rubric is too vague to climb. Tighten the criteria that swung most and redo round 0." : ""}`);
+function report() {
+  const rows = history();
+  const first = rows[0];
+  const last = best();
+  if (!first || !last) die("nothing to report yet");
+  // Held-back measures run here, once, on the work as it stands now.
+  const held = measure(measures.filter((m) => m.final));
+  const heldLines = Object.entries(held).map(([k, v]) => `held-back check ${k}: ${v}`);
+  const diff = first.sha !== "-" && last.sha !== "-" && first.sha !== last.sha ? sh(`git diff --stat ${first.sha} ${last.sha}`) : null;
+  const esc = (s: string) => s.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+  const show = (p: string, name: string) => {
+    if (!existsSync(p)) return "<p class=none>not captured</p>";
+    if (/\.(png|jpe?g|gif|webp|svg)$/i.test(name)) return `<img loading=lazy src="${esc(relative(dir, p))}" alt="${esc(name)}">`;
+    const text = readFileSync(p, "utf8");
+    return `<pre>${esc(text.length > 20000 ? `${text.slice(0, 20000)}\n…` : text)}</pre>`;
+  };
+  const ev = (r: string) => join(rdir(r), "evidence");
+  const files = [...new Set([...walk(ev(first.round)), ...walk(ev(last.round))])];
+  const cells = (l: string[], tag: string) => `<tr>${l.map((x) => `<${tag}>${esc(x)}</${tag}>`).join("")}</tr>`;
+  const [head = [], , ...body] = table().split("\n\n")[0]?.split("\n").map((l) => l.split("|").slice(1, -1).map((x) => x.trim())) ?? [];
+  const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Hill climb: before and after</title>
+<style>:root{color-scheme:light dark}body{font:15px/1.5 system-ui,sans-serif;margin:0 auto;max-width:1400px;padding:16px}table{border-collapse:collapse;display:block;overflow-x:auto}td,th{border:1px solid #8884;padding:4px 8px;text-align:left}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}.pair>div{min-width:0}img{max-width:100%;border:1px solid #8884}pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8884;padding:8px;margin:0}
+h2{margin-top:32px;font-size:16px}.none{opacity:.6}button{font:inherit;padding:6px 12px;display:none}
+@media(max-width:700px){.pair{grid-template-columns:1fr}.pair>div+div{display:none}.pair.flip>div{display:none}.pair.flip>div+div{display:block}button{display:inline-block}}</style>
+<h1>${esc(c.goal)}</h1><table>${cells(head, "th")}${body.map((l) => cells(l, "td")).join("")}</table>
+${heldLines.map((l) => `<p><b>${esc(l)}</b></p>`).join("")}${diff?.ok ? `<h2>What changed (round ${first.round} to round ${last.round})</h2><pre>${esc(diff.out)}</pre>` : ""}
+${walk(join(dir, "reference")).map((f) => `<h2>The bar: ${esc(f)}</h2>${show(join(dir, "reference", f), f)}`).join("\n")}
+${files.map((f) => `<h2>${esc(f)} <button onclick="this.parentNode.nextElementSibling.classList.toggle('flip')">before / after</button></h2><div class=pair><div><b>Before (round ${first.round})</b><br>${show(join(ev(first.round), f), f)}</div><div><b>After (round ${last.round})</b><br>${show(join(ev(last.round), f), f)}</div></div>`).join("\n")}`;
+  writeFileSync(join(dir, "report.html"), html);
+  console.log(`wrote ${join(dir, "report.html")}\n${heldLines.join("\n")}\n\n${table()}`);
 }
 
 switch (cmd) {
-  case "pack": {
-    const [round, control] = positional;
-    if (!round) die("usage: pack <dir> <round> [control-dir] [--audit]");
-    pack(round, control, args.includes("--audit") || round === "audit");
+  case "prep":
+    prep(needRound());
     break;
-  }
-  case "score": {
-    const [round] = positional;
-    if (!round) die("usage: score <dir> <round> [--targets id,id]");
-    const s = score(round);
-    report(s);
-    const kept = best()?.round;
-    if (round === "audit") auditVerdicts(s);
-    else if (round.endsWith("-confirm") || (!contract.reference && kept)) decide(s, null);
-    else if (contract.reference && kept && kept !== round && baseOf(round) !== kept) decide(s, readJson<Scores>(scoresFile(kept)));
-    if (!baseOf(round)) standing(s);
+  case "score":
+    score(needRound());
     break;
-  }
-  case "log": {
-    const [round, decision, ...note] = positional;
-    if (!round || !decision) die('usage: log <dir> <round> <keep|revert> "<what you tried>"');
-    log(round, decision, note.join(" "));
+  case "log":
+    log(needRound(), rest[0] ?? "", rest.slice(1).join(" "));
     break;
-  }
   case "status":
     status();
     break;
-  case "noise": {
-    const [a, b] = positional;
-    if (!a || !b) die("usage: noise <dir> <roundA> <roundB>");
-    noise(a, b);
+  case "report":
+    report();
     break;
-  }
   default:
-    die(`unknown command "${cmd}"`);
+    die(USAGE);
 }

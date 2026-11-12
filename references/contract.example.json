@@ -1,0 +1,24 @@
+{
+  "goal": "One paragraph judges will read: what this is, who uses it, and what job it does. No product names.",
+  "reference": "What the bar is, in a few words, or null. Its files go in reference/ next to this file.",
+  "criteria": [
+    {
+      "id": "clarity",
+      "means": "A first-time user can find and finish the main tasks without guessing.",
+      "levels": "9: every task has one obvious path. 7: the main tasks work, one needs a second look. 5: at least one task needs hunting."
+    }
+  ],
+  "must": ["Deleting something asks first and names what will be deleted."],
+  "gates": ["bun run typecheck", "bun test"],
+  "measures": [
+    { "id": "accuracy", "cmd": "bun eval.ts", "better": "higher", "target": 0.95 },
+    { "id": "p95_ms", "cmd": "bun bench.ts", "better": "lower", "pattern": "p95: ([0-9.]+)", "slack": 5 },
+    { "id": "accuracy_held_back", "cmd": "bun eval.ts data/held-back.jsonl", "better": "higher", "final": true }
+  ],
+  "evidence": ["README.md", "docs/facts.md"],
+  "capture": "bun scripts/screenshots.ts",
+  "judges": { "J1": "anthropic", "J2": "openai", "J3": "openai" },
+  "target": 9,
+  "rounds": 8,
+  "minutes": 60
+}

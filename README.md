@@ -1,27 +1,29 @@
 # hill-climb
 
-A skill for Claude Code and Codex. It improves something you're building, round by round, until judges from different AI model families rate it level with a reference you pick.
+A skill for Claude Code and Codex. It improves something in rounds until it is good enough, and it doesn't let the agent grade its own work.
 
-You give it a task, a reference such as a competitor's page, the qualities you want to match, and what must keep working. It writes a rubric, asks you to approve it, and then loops on its own:
+You say what you want in one line. The agent looks at the project, proposes a short plan, and after your yes it loops on its own:
 
-1. Fix the biggest problems the judges found.
-2. Run your checks, such as typecheck, lint, and tests.
-3. Three judges compare your version with the reference without knowing which is which. They see no history and no earlier scores.
-4. Keep the change if the gap to the reference closed. Otherwise roll back to the best version so far.
+1. Change the work.
+2. Run your checks and measurements.
+3. Have judges from other model families compare the new version with the best one so far, without knowing which is which.
+4. Keep the change only if it won. Otherwise go back to the best version.
 
-It stops when you reach the reference, when three rounds in a row fail to improve, or at a round or time limit. You get the best version, a score table by round, and the gaps that remain.
+It stops at the target, after three failed rounds in a row, or at a round or time limit. You get the best version, a score table, and a `report.html` that shows the evidence before and after, side by side.
 
-It works for UI, copy, docs, code, API design, and CLIs. Only the evidence the judges look at changes.
+It works for UI, code, copy, docs and ideas. When a command can produce the score, such as an accuracy number or a benchmark, it climbs on that number and skips the judges.
 
-## Why it's built this way
+## Use
 
-The simple loop, "score it 1 to 10 and iterate until the average is 9", fails in known ways. Scores inflate as judges see history. Judges get swayed by claims and by the order they see things in. Panels agree on bugs that don't exist. New revisions break what worked. Each rule in the skill blocks one of these, and [`references/why.md`](references/why.md) links each rule to its source. [`RESEARCH.md`](RESEARCH.md) surveys the existing tools and papers.
+In Claude Code, type `/hill-climb` and what you want. In Codex, ask for the hill-climb skill by name.
 
-## Requirements
+```
+/hill-climb the settings page, until it's as clear as Linear's
+/hill-climb make extractDates score as high as possible on bun eval.ts
+/hill-climb come up with a name for this app
+```
 
-- Claude Code and the Codex CLI, both logged in. Judges have to come from two model families.
-- [bun](https://bun.sh), to run the helper script.
-- For UI work, a browser tool such as the Playwright MCP.
+You can add a target, a number of rounds, a time limit, a reference, or your own criteria, in plain words. You can also change any of them while it runs.
 
 ## Install
 
@@ -30,41 +32,33 @@ git clone https://github.com/crakjack/hill-climb ~/.claude/skills/hill-climb
 ~/.claude/skills/hill-climb/install.sh
 ```
 
-`install.sh` copies the skill into `~/.codex/skills/hill-climb` and warns about anything missing. To update, run `git pull` in `~/.claude/skills/hill-climb` and run `install.sh` again. Restart open sessions afterwards.
+`install.sh` copies the skill into `~/.codex/skills/hill-climb`. To update, run `git pull` in `~/.claude/skills/hill-climb`, run `install.sh` again, and restart open sessions.
 
-## Use
+You need [bun](https://bun.sh) for the helper script, and a way to reach models from two families, for example Claude Code plus the Codex CLI.
 
-In Claude Code, type `/hill-climb`. In Codex, ask for the hill-climb skill by name.
+## Why it's built this way
 
-```
-/hill-climb build the billing settings page
-ref: https://competitor.com/settings/billing
-match: how they show plan limits, the upgrade flow
-must work: changing plan asks for confirmation, invoices download
-constraints: our design tokens, no new dependencies
-target: 9   rounds: 8   budget: 60m      (optional)
-```
+The simple loop, "score it 1 to 10 and iterate until the average is 9", fails in known ways: scores inflate when judges see history, panels agree on bugs that don't exist, and new revisions break what worked. [`RESEARCH.md`](RESEARCH.md) surveys the papers and tools behind the rules.
 
-You can paste your own rubric too. Without a `ref`, each round is judged against the best version so far.
+The current shape also comes from studying fourteen real runs of the first version. What they showed:
 
-The run keeps its state in `.hillclimb/<slug>/` in your project and works on a `hillclimb/<slug>` branch, so you can stop and resume it, then merge or delete the branch.
-
-## Changing the judges
-
-The default panel is fable-5.1, gpt-6-astra, and gpt-6.1-sol, with opus-5.5 as the final auditor. To use other models, edit [`references/panel-claude-code.md`](references/panel-claude-code.md) or [`references/panel-codex.md`](references/panel-codex.md). Keep three judges from two families, with one family different from the model doing the building.
+- **Compare with your own best version, not with the reference.** Scoring against a competitor each round needed a second "confirm" panel about thirty times, and a dozen of those reversed the first decision. The reference now only defines what a 9 means.
+- **Measure what can be measured.** Agents built their own scoring scripts for accuracy and search quality because the skill only knew judges.
+- **A score isn't proof it works.** One run ended "target met" with wrong numbers on screen, because judges saw only screenshots.
+- **Don't make people write a brief.** Launch prompts had grown to 45 lines. One line is now enough.
+- **Put the glue in the helper.** Every run rebuilt prompt filling, reply collection, gates and the before/after report.
 
 ## Files
 
 ```
-SKILL.md                         the loop
-references/contract-template.md  the contract and how to write a rubric
-references/judge-prompt.md       what each judge is sent
-references/panel-*.md            how to call judges from each tool
-references/ui.md                 capturing screenshots for UI work
-references/extras.md             close calls, noisy scores, and other unusual cases
-references/why.md                the source behind each rule
-scripts/hc.ts                    blinding, scoring, and the keep-or-revert rule
+SKILL.md                          the instructions the agent follows
+references/contract.example.json  the plan file, with every field
+references/judge-prompt.md        what each judge is told
+references/judges.md              ways to call judges
+scripts/hc.ts                     runs checks, blinds evidence, scores, reports
 ```
+
+To change what judges are told, edit `references/judge-prompt.md`. The skill names no models. It uses the strongest ones it can reach and follows the model preferences in your own agent instructions.
 
 ## Uninstall
 

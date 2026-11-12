@@ -1,1 +1,3 @@
 .DS_Store
+# the previous version, kept on this machine so runs started with it can finish
+legacy/

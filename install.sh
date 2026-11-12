@@ -16,8 +16,6 @@ for DEST in "$HOME/.claude/skills/hill-climb" "$HOME/.codex/skills/hill-climb"; 
 done
 
 command -v bun >/dev/null || echo "needs  bun for scripts/hc.ts: curl -fsSL https://bun.sh/install | bash"
-command -v claude >/dev/null || echo "needs  claude CLI, for the Claude judges when running in Codex"
-command -v codex >/dev/null || echo "needs  codex CLI, for the GPT judges"
-[ -f "$HOME/.claude/agents/codex-runner.md" ] ||
-  echo "note   no codex-runner agent found. Claude Code will call codex exec directly for GPT judges."
+command -v claude >/dev/null && command -v codex >/dev/null ||
+  echo "note   judges must come from two model families. Having both the claude and codex CLIs is one way to get that."
 echo "done. Restart open Claude Code and Codex sessions to pick it up."
