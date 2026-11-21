@@ -12,7 +12,7 @@ Improve one thing in rounds. Each round you change the work, something other tha
 One line from the user is enough.
 
 1. **Look first.** Read the project, run it, and open any reference they named. Learn what it is, how to test it, and where it's weak. If the score will come from a data file, split that file before you read its rows.
-2. **Propose the plan in one message of about 150 words.** Lead with anything you found that changes it. Say what you'll improve and leave alone, how it's scored, what must keep working, which models judge, and when you'll stop. By default that's a 9, eight rounds after the baseline, or an hour. Promise only scores your evidence can show. Leave out file paths and score arithmetic. If the target or their limits look out of reach, say so. End with at most two questions, each with the answer you'll assume, so that "yes" is a complete reply.
+2. **Propose the plan in one message of about 150 words.** Lead with anything you found that changes it. Say what you'll improve and leave alone, how it's scored, what must keep working, which models judge, and when you'll stop. By default that's a 9, ten rounds after the baseline, or an hour. Promise only scores your evidence can show. Leave out file paths and score arithmetic. If the target or their limits look out of reach, say so. End with at most two questions, each with the answer you'll assume, so that "yes" is a complete reply.
 3. **Start on their yes.** If they said to go ahead without them, start on your defaults and list what you assumed in the report.
 
 A narrow goal climbs faster than a broad one. Asked to "improve the app", propose the part that matters most and offer the rest as later runs. The user may change the plan at any time. Update the contract and carry on.
@@ -33,7 +33,7 @@ When the work is ideas, such as names, judge a shortlist as a whole. Each round,
 
 ## Rounds
 
-In a git project, work on a branch and commit before each `prep`. Below, `hc` means `bun <this skill>/scripts/hc.ts`, run from the project root, and `<dir>` is `.hillclimb/<slug>`.
+In a git project, work on a branch and commit before each `prep`. Below, `hc` means `bun <this skill>/scripts/hc.ts`, run from the project root, and `<dir>` is `.hillclimb/<slug>`. Keep your own screenshots, captures and logs in `<dir>/scratch/`, never in `/tmp` or the project.
 
 Round 00 is the starting point. If nothing exists yet, build a first version. Then, every round:
 
@@ -69,5 +69,7 @@ Then run `hc report <dir>`. It runs the `final` measures and writes `report.html
 - which findings you rejected, and why
 - what the evidence didn't cover, such as devices, real data, or flows you didn't capture
 - which models judged
+
+Then clean up. Delete `<dir>/scratch/` and the evidence of every round except round 00 and the best one, which the report shows. Keep the scores and the judges' replies. `hc log` already removes the judges' copies from the temp folder. Before a new run, do the same for any finished run in the project that wasn't cleaned up.
 
 `hc status <dir>` shows where a run stands. Run it first when you pick a run back up.

@@ -143,6 +143,10 @@ const collect = (r: string, m: Mapping) => {
   mkdirSync(join(rdir(r), "judges"), { recursive: true });
   for (const j of Object.keys(m.judges)) if (existsSync(join(m.root, j, "reply.md"))) cpSync(join(m.root, j, "reply.md"), join(rdir(r), "judges", `${j}.md`));
 };
+// Judges read their copies from the temp folder. Once the replies are saved in the round, the copies go.
+const dropPacket = (m: Mapping | null) => {
+  if (m && /^hc-[A-Za-z0-9]{6}$/.test(basename(m.root))) rmSync(m.root, { recursive: true, force: true });
+};
 const needRound = () => round ?? die(`${cmd} needs a round, for example: bun hc.ts ${cmd} ${dir} 00`);
 
 function measure(which: Measure[]): Record<string, number> {
@@ -227,6 +231,7 @@ function prep(r: string) {
   let old = existsSync(mapFile) ? readJson<Mapping>(mapFile) : null;
   const replies = join(rdir(r), "judges");
   if (old) collect(r, old);
+  dropPacket(old);
   const bar = walk(join(dir, "reference"));
   // Everything a judge was shown. If any of it changes, earlier replies no longer apply.
   const basis = [digest(evidence), bestDir ? digest(bestDir) : "", digest(join(dir, "reference")), rubricId, c.goal].join("|");
@@ -438,6 +443,12 @@ function log(r: string, decision: string, note: string) {
     rubric: rubricId,
     note: `${against ? `[verdict was ${s?.verdict}] ` : ""}${note.replace(/\s+/g, " ").trim() || "-"}`,
   };
+  const mapFile = join(rdir(r), "mapping.json");
+  if (existsSync(mapFile)) {
+    const m = readJson<Mapping>(mapFile);
+    collect(r, m);
+    dropPacket(m);
+  }
   if (!existsSync(histFile)) writeFileSync(histFile, `${COLS.join("\t")}\n`);
   appendFileSync(histFile, `${COLS.map((k) => row[k]).join("\t")}\n`);
   console.log(`logged round ${r}: ${decision}`);
