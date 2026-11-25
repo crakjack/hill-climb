@@ -256,7 +256,11 @@ function prep(r: string) {
       if (from) cpSync(from, join(folder, s), { recursive: true });
     }
     if (bar.length) cpSync(join(dir, "reference"), join(folder, "bar"), { recursive: true });
-    writeFileSync(join(folder, "prompt.md"), prompt(folder, sides, walk(join(folder, "A")), bar));
+    // List every file on either side, so files one version added or removed aren't hidden.
+    const a = walk(join(folder, "A"));
+    const b = sides.B ? walk(join(folder, "B")) : a;
+    const files = [...new Set([...a, ...b])].sort().map((f) => (!a.includes(f) ? `${f} (B only)` : !b.includes(f) ? `${f} (A only)` : f));
+    writeFileSync(join(folder, "prompt.md"), prompt(folder, sides, files, bar));
     console.log(`${j} (${family(j)}): ${join(folder, "prompt.md")}`);
   });
   writeFileSync(mapFile, `${JSON.stringify(mapping, null, 2)}\n`);

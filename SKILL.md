@@ -5,7 +5,7 @@ description: Improve anything in rounds until it is good enough. Works for UI, c
 
 # Hill climb
 
-Improve one thing in rounds. Each round you change the work, something other than you says whether it got better, and you keep the change only if it did. That something is a measurement wherever a command can produce the number, and a panel of other models wherever it takes judgment.
+Improve a piece of work in rounds, scored against a set of rubrics. Each round, change the work, score it blind on every rubric next to the best version so far, and keep the change only if it wins overall without dropping on any rubric.
 
 ## Start
 
